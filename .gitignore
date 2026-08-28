@@ -1,0 +1,60 @@
+# Build outputs
+bin/
+obj/
+build/
+out/
+*.exe
+*.dll
+*.pdb
+*.cache
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+
+# C++ build
+CMakeFiles/
+cmake-build-*/
+*.o
+*.obj
+*.lib
+*.engine
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Data & Logs
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/captures/
+logs/
+runtime/
+
+# Web
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Screenshots (keep folder, ignore content)
+assets/ocr_samples/*.png
+assets/ocr_samples/*.jpg
+!assets/ocr_samples/.gitkeep
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Temp
+*.tmp
+*.bak
+*.swp

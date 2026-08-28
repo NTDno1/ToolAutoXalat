@@ -1,0 +1,26 @@
+name: greedy-stats-web
+
+services:
+  backend:
+    build:
+      context: ../apps/backend/GreedyStats.Api
+    environment:
+      Database__Path: /data/greedy_stats.db
+      Dashboard__TimeZoneId: Asia/Bangkok
+      Alerts__WebhookUrl: ${GREEDY_ALERT_WEBHOOK_URL:-}
+    volumes:
+      - ../data:/data
+    ports:
+      - "5117:8080"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../apps/frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+
+# Scanner intentionally remains a Windows host process beside BlueStacks.
