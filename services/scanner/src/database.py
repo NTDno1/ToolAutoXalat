@@ -15,9 +15,12 @@ PRAGMA busy_timeout=10000;
 
 CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number INTEGER,
+    round_local_date TEXT,
+    source_serial TEXT NOT NULL DEFAULT '',
     item_code TEXT NOT NULL,
     item_name TEXT NOT NULL,
-    category TEXT NOT NULL CHECK(category IN ('VEGETABLE', 'MEAT')),
+    category TEXT NOT NULL CHECK(category IN ('VEGETABLE', 'MEAT', 'SPECIAL')),
     detected_at_utc TEXT NOT NULL,
     confidence REAL NOT NULL,
     sequence_json TEXT NOT NULL,
@@ -25,9 +28,6 @@ CREATE TABLE IF NOT EXISTS results (
     capture_path TEXT,
     created_at_utc TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ix_results_detected_at ON results(detected_at_utc DESC);
-CREATE INDEX IF NOT EXISTS ix_results_category_detected_at
-    ON results(category, detected_at_utc DESC);
 
 CREATE TABLE IF NOT EXISTS scanner_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,8 +39,6 @@ CREATE TABLE IF NOT EXISTS scanner_events (
     occurred_at_utc TEXT NOT NULL,
     acknowledged INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS ix_scanner_events_occurred_at
-    ON scanner_events(occurred_at_utc DESC);
 
 CREATE TABLE IF NOT EXISTS scanner_state (
     state_key TEXT PRIMARY KEY,
@@ -63,6 +61,17 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
     attempted_at_utc TEXT,
     FOREIGN KEY(result_id) REFERENCES results(id)
 );
+"""
+
+INDEXES = """
+CREATE INDEX IF NOT EXISTS ix_results_detected_at ON results(detected_at_utc DESC);
+CREATE INDEX IF NOT EXISTS ix_results_category_detected_at
+    ON results(category, detected_at_utc DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_results_source_round
+    ON results(source_serial, round_local_date, round_number)
+    WHERE round_number IS NOT NULL AND round_local_date IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_scanner_events_occurred_at
+    ON scanner_events(occurred_at_utc DESC);
 """
 
 
@@ -94,6 +103,51 @@ class ScannerDatabase:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='results'"
+            ).fetchone()
+            table_sql = str(row[0]) if row else ""
+            if (
+                "'SPECIAL'" not in table_sql.upper()
+                or "ROUND_NUMBER" not in table_sql.upper()
+                or "SOURCE_SERIAL" not in table_sql.upper()
+            ):
+                connection.executescript(
+                    """
+                    PRAGMA foreign_keys=OFF;
+                    BEGIN IMMEDIATE;
+                    DROP TABLE IF EXISTS results_v2;
+                    CREATE TABLE results_v2 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        round_number INTEGER,
+                        round_local_date TEXT,
+                        source_serial TEXT NOT NULL DEFAULT '',
+                        item_code TEXT NOT NULL,
+                        item_name TEXT NOT NULL,
+                        category TEXT NOT NULL CHECK(category IN ('VEGETABLE', 'MEAT', 'SPECIAL')),
+                        detected_at_utc TEXT NOT NULL,
+                        confidence REAL NOT NULL,
+                        sequence_json TEXT NOT NULL,
+                        detection_reason TEXT NOT NULL,
+                        capture_path TEXT,
+                        created_at_utc TEXT NOT NULL
+                    );
+                    INSERT INTO results_v2(
+                        id, round_number, round_local_date, source_serial,
+                        item_code, item_name, category, detected_at_utc, confidence,
+                        sequence_json, detection_reason, capture_path, created_at_utc
+                    )
+                    SELECT id, NULL, NULL, '127.0.0.1:5575',
+                           item_code, item_name, category, detected_at_utc, confidence,
+                           sequence_json, detection_reason, capture_path, created_at_utc
+                    FROM results;
+                    DROP TABLE results;
+                    ALTER TABLE results_v2 RENAME TO results;
+                    COMMIT;
+                    PRAGMA foreign_keys=ON;
+                    """
+                )
+            connection.executescript(INDEXES)
 
     def set_state(self, key: str, value: str) -> None:
         now = utc_text()
@@ -124,6 +178,9 @@ class ScannerDatabase:
         confidence: float,
         sequence: list[str],
         detection_reason: str,
+        source_serial: str,
+        round_number: Optional[int],
+        round_local_date: Optional[str],
         detected_at: Optional[datetime] = None,
         capture_path: Optional[str] = None,
     ) -> int:
@@ -132,12 +189,16 @@ class ScannerDatabase:
         with self.connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO results(
+                INSERT OR IGNORE INTO results(
+                    round_number, round_local_date, source_serial,
                     item_code, item_name, category, detected_at_utc, confidence,
                     sequence_json, detection_reason, capture_path, created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    round_number,
+                    round_local_date,
+                    source_serial,
                     item_code,
                     item_name,
                     category,
@@ -149,7 +210,19 @@ class ScannerDatabase:
                     now,
                 ),
             )
-            return int(cursor.lastrowid)
+            if cursor.rowcount > 0:
+                return int(cursor.lastrowid)
+            if round_number is not None and round_local_date is not None:
+                row = connection.execute(
+                    """
+                    SELECT id FROM results
+                    WHERE source_serial=? AND round_local_date=? AND round_number=?
+                    """,
+                    (source_serial, round_local_date, round_number),
+                ).fetchone()
+                if row:
+                    return int(row[0])
+            raise RuntimeError("Result insert was ignored without an existing round")
 
     def update_result_capture(self, result_id: int, capture_path: str) -> None:
         with self.connect() as connection:

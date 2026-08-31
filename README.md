@@ -4,9 +4,9 @@
 
 Ba dự án chạy độc lập đã được tổ chức trong `apps/` và `services/`:
 
-- `services/scanner`: Python quét BlueStacks port `5575` mỗi 3 giây, đọc đủ 8 ô.
-- `apps/backend/GreedyStats.Api`: ASP.NET Core API, SQLite, thống kê và webhook.
-- `apps/frontend`: React dashboard, tự cập nhật mỗi 3 giây.
+- `services/scanner`: Python quét nền BlueStacks port `5555` mỗi 1,5 giây, OCR Round và đọc đủ 8 ô/10 vật phẩm.
+- `apps/backend/GreedyStats.Api`: ASP.NET Core API, SQLite, thống kê bệt theo ngày, dự đoán và webhook Zalo/admin.
+- `apps/frontend`: React dashboard realtime, tự cập nhật mỗi 1,5 giây.
 
 Khởi động toàn bộ bằng tiến trình ẩn (không chiếm chuột/focus):
 

@@ -7,7 +7,22 @@ services:
     environment:
       Database__Path: /data/greedy_stats.db
       Dashboard__TimeZoneId: Asia/Bangkok
-      Alerts__WebhookUrl: ${GREEDY_ALERT_WEBHOOK_URL:-}
+      Dashboard__DayBoundaryHour: ${GREEDY_DAY_BOUNDARY_HOUR:-23}
+      Alerts__UserWebhookUrl: ${GREEDY_USER_WEBHOOK_URL:-}
+      Alerts__AdminWebhookUrl: ${GREEDY_ADMIN_WEBHOOK_URL:-}
+      Prediction__AiBaseUrl: ${GREEDY_AI_BASE_URL:-https://api.groq.com/openai/v1}
+      Prediction__AiRoute: ${GREEDY_AI_ROUTE:-/chat/completions}
+      Prediction__AiModel: ${GREEDY_AI_MODEL:-openai/gpt-oss-120b}
+      Prediction__AiApiKey: ${GREEDY_AI_API_KEY:-}
+      Prediction__AiTestMode: ${GREEDY_AI_TEST_MODE:-false}
+      Prediction__CompoundBaseUrl: ${GREEDY_COMPOUND_BASE_URL:-https://api.groq.com/openai/v1}
+      Prediction__CompoundRoute: ${GREEDY_COMPOUND_ROUTE:-/chat/completions}
+      Prediction__CompoundModel: ${GREEDY_COMPOUND_MODEL:-groq/compound-mini}
+      Prediction__CompoundApiKey: ${GREEDY_COMPOUND_API_KEY:-}
+      Prediction__CompoundTestMode: ${GREEDY_COMPOUND_TEST_MODE:-false}
+      Admin__Username: ${GREEDY_ADMIN_USERNAME:-admin}
+      Admin__PasswordHash: ${GREEDY_ADMIN_PASSWORD_HASH:-}
+      Admin__SessionHours: ${GREEDY_ADMIN_SESSION_HOURS:-8}
     volumes:
       - ../data:/data
     ports:

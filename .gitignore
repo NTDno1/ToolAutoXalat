@@ -38,6 +38,8 @@ data/*.db-shm
 data/captures/
 logs/
 runtime/
+apps/backend/GreedyStats.Api/appsettings.Admin.json
+apps/backend/GreedyStats.Api/appsettings.Secrets.json
 
 # Web
 node_modules/

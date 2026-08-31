@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import cv2
 import numpy as np
@@ -36,6 +37,7 @@ from detector import (  # noqa: E402
     ITEMS,
     find_sequence_shift,
 )
+from round_detector import RoundDetectionError, RoundDetector  # noqa: E402
 
 
 class BlueStacksFrameSource:
@@ -107,6 +109,13 @@ class GreedyScanner:
             self.config["history"],
             self.config["detection"],
         )
+        self.round_detector = RoundDetector(self.config["round"])
+        self.local_timezone = ZoneInfo(
+            self.config["round"].get("timezone", "Asia/Bangkok")
+        )
+        self.round_day_boundary_hour = max(
+            0, min(23, int(self.config["round"].get("day_boundary_hour", 23)))
+        )
 
         scanner = self.config["scanner"]
         self.scan_interval = float(scanner["scan_interval_seconds"])
@@ -122,8 +131,13 @@ class GreedyScanner:
         self.stop_requested = False
         self.previous_sequence = self._load_sequence()
         self.last_result_at = self._load_last_result_time()
+        self.current_round = self._load_round()
+        self.current_round_date = self.database.get_state(
+            self._state_key("round_local_date")
+        )
         self.first_successful_scan = True
         self.capture_failures = 0
+        self.round_failures = 0
         self.no_result_attempts = 0
         self.last_alert_at: dict[str, datetime] = {}
 
@@ -149,8 +163,11 @@ class GreedyScanner:
         logger.addHandler(file_handler)
         return logger
 
+    def _state_key(self, name: str) -> str:
+        return f"{name}:{self.frame_source.serial}"
+
     def _load_sequence(self) -> Optional[list[str]]:
-        raw = self.database.get_state("last_sequence")
+        raw = self.database.get_state(self._state_key("last_sequence"))
         if not raw:
             return None
         try:
@@ -160,7 +177,7 @@ class GreedyScanner:
             return None
 
     def _load_last_result_time(self) -> datetime:
-        raw = self.database.get_state("last_result_at_utc")
+        raw = self.database.get_state(self._state_key("last_result_at_utc"))
         if raw:
             try:
                 return datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -168,16 +185,85 @@ class GreedyScanner:
                 pass
         return utc_now()
 
+    def _load_round(self) -> Optional[int]:
+        raw = self.database.get_state(self._state_key("current_round"))
+        try:
+            return int(raw) if raw else None
+        except ValueError:
+            return None
+
+    def _local_date(self) -> str:
+        local_now = datetime.now(self.local_timezone)
+        if self.round_day_boundary_hour != 0 and local_now.hour >= self.round_day_boundary_hour:
+            local_now += timedelta(days=1)
+        return local_now.date().isoformat()
+
     def _save_runtime_state(self, status: str, sequence: Optional[list[str]] = None) -> None:
         now = utc_now().isoformat(timespec="milliseconds").replace("+00:00", "Z")
         self.database.set_state("scanner_status", status)
         self.database.set_state("scanner_heartbeat_utc", now)
+        self.database.set_state("scanner_source_serial", self.frame_source.serial)
         if sequence is not None:
             self.database.set_state("last_sequence", json.dumps(sequence))
+            self.database.set_state(
+                self._state_key("last_sequence"), json.dumps(sequence)
+            )
         self.database.set_state(
             "last_result_at_utc",
             self.last_result_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         )
+        self.database.set_state(
+            self._state_key("last_result_at_utc"),
+            self.last_result_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        )
+        if self.current_round is not None:
+            self.database.set_state("scanner_current_round", str(self.current_round))
+            self.database.set_state(
+                self._state_key("current_round"), str(self.current_round)
+            )
+        if self.current_round_date:
+            self.database.set_state(
+                self._state_key("round_local_date"), self.current_round_date
+            )
+
+    def _read_round(self, frame: np.ndarray) -> Optional[int]:
+        try:
+            detection = self.round_detector.detect(frame)
+            self.round_failures = 0
+            self.logger.info("ROUND OCR=%s raw=%r", detection.number, detection.raw_text)
+            return detection.number
+        except (RoundDetectionError, OSError) as exc:
+            self.round_failures += 1
+            self.logger.warning(
+                "Round OCR attempt %s/%s failed: %s",
+                self.round_failures,
+                self.max_failed_attempts,
+                exc,
+            )
+            if self.round_failures >= self.max_failed_attempts:
+                self._notify_failure(
+                    "ROUND_OCR_FAILED",
+                    "Không đọc được số Today's Round sau 4 lần thử",
+                    {"attempts": self.round_failures, "error": str(exc)},
+                    frame,
+                )
+                self.round_failures = 0
+            return None
+
+    def _rounds_for_shift(
+        self,
+        shift: int,
+        local_date: str,
+        observed_round: Optional[int] = None,
+    ) -> list[Optional[int]]:
+        end_round = observed_round
+        if end_round is None and self.current_round_date == local_date:
+            end_round = (
+                self.current_round + shift if self.current_round is not None else None
+            )
+        if end_round is None or end_round < shift:
+            return [None] * shift
+        return list(range(end_round - shift + 1, end_round + 1))
 
     def _save_debug_frame(self, frame: Optional[np.ndarray], prefix: str) -> Optional[str]:
         if frame is None:
@@ -248,7 +334,10 @@ class GreedyScanner:
         detection: HistoryDetection,
         frame: np.ndarray,
         reason: str,
+        round_number: Optional[int] = None,
+        round_local_date: Optional[str] = None,
     ) -> int:
+        round_local_date = round_local_date or self._local_date()
         slot = next((value for value in detection.slots if value.code == code), detection.slots[0])
         item = ITEMS[code]
         detected_at = utc_now()
@@ -259,16 +348,23 @@ class GreedyScanner:
             confidence=slot.confidence,
             sequence=detection.sequence,
             detection_reason=reason,
+            source_serial=self.frame_source.serial,
+            round_number=round_number,
+            round_local_date=round_local_date,
             detected_at=detected_at,
         )
         self._save_result_crop(frame, result_id)
         self.last_result_at = detected_at
+        if round_number is not None:
+            self.current_round = round_number
+            self.current_round_date = round_local_date
         self.database.set_state(
             "last_result_id", str(result_id)
         )
         self.logger.info(
-            "NEW RESULT id=%s item=%s category=%s confidence=%.3f reason=%s",
+            "NEW RESULT id=%s round=%s item=%s category=%s confidence=%.3f reason=%s",
             result_id,
+            round_number,
             item["name"],
             item["category"],
             slot.confidence,
@@ -276,7 +372,7 @@ class GreedyScanner:
         )
         return result_id
 
-    def scan_once(self) -> dict:
+    def _scan_once_legacy(self) -> dict:
         frame: Optional[np.ndarray] = None
         try:
             frame = self.frame_source.capture()
@@ -413,6 +509,224 @@ class GreedyScanner:
         return {
             "status": "recorded" if recorded else "waiting",
             "recordedIds": recorded,
+            "sequence": sequence,
+            "minimumConfidence": detection.minimum_confidence,
+            "newMarkerScore": detection.new_marker_score,
+        }
+
+    def scan_once(self) -> dict:
+        frame: Optional[np.ndarray] = None
+        try:
+            frame = self.frame_source.capture()
+            detection = self.detector.detect(frame)
+            self.capture_failures = 0
+        except (RuntimeError, DetectionError, OSError) as exc:
+            self.capture_failures += 1
+            self._save_runtime_state("DETECTION_RETRY")
+            self.logger.warning(
+                "Detection attempt %s/%s failed: %s",
+                self.capture_failures,
+                self.max_failed_attempts,
+                exc,
+            )
+            if self.capture_failures >= self.max_failed_attempts:
+                self._notify_failure(
+                    "DETECTION_FAILED",
+                    f"Không nhận diện đủ 8 ô sau {self.capture_failures} lần quét",
+                    {"attempts": self.capture_failures, "error": str(exc)},
+                    frame,
+                )
+                self.capture_failures = 0
+            return {"status": "detection_failed", "error": str(exc)}
+
+        sequence = detection.sequence
+        local_date = self._local_date()
+
+        if self.previous_sequence is None:
+            observed_round = self._read_round(frame)
+            if observed_round is not None:
+                self.current_round = observed_round
+                self.current_round_date = local_date
+            self.previous_sequence = sequence
+            self.last_result_at = utc_now()
+            self.first_successful_scan = False
+            self._save_runtime_state("BASELINE_READY", sequence)
+            self.logger.info(
+                "Baseline ready | round=%s | sequence=%s | min_confidence=%.3f",
+                self.current_round,
+                sequence,
+                detection.minimum_confidence,
+            )
+            return {
+                "status": "baseline",
+                "round": self.current_round,
+                "sequence": sequence,
+            }
+
+        if self.first_successful_scan:
+            observed_round = self._read_round(frame)
+            startup_shift = find_sequence_shift(self.previous_sequence, sequence)
+            recovered = 0
+            if startup_shift:
+                round_numbers = self._rounds_for_shift(
+                    startup_shift, local_date, observed_round
+                )
+                for code, round_number in zip(
+                    reversed(sequence[:startup_shift]), round_numbers
+                ):
+                    self._record_result(
+                        code,
+                        detection,
+                        frame,
+                        f"startup_recovered_shift_{startup_shift}",
+                        round_number,
+                        local_date,
+                    )
+                    recovered += 1
+            elif (
+                sequence == self.previous_sequence
+                and observed_round is not None
+                and self.current_round is not None
+                and self.current_round_date == local_date
+                and 1 <= observed_round - self.current_round <= 4
+                and len(set(sequence)) == 1
+            ):
+                for round_number in range(self.current_round + 1, observed_round + 1):
+                    self._record_result(
+                        sequence[0],
+                        detection,
+                        frame,
+                        "startup_round_recovered_identical",
+                        round_number,
+                        local_date,
+                    )
+                    recovered += 1
+            elif sequence != self.previous_sequence:
+                self._notify_failure(
+                    "SEQUENCE_DESYNC",
+                    "Chuỗi 8 ô khi khởi động không còn căn chỉnh được; đã tạo baseline mới",
+                    {
+                        "previous": self.previous_sequence,
+                        "current": sequence,
+                        "observedRound": observed_round,
+                    },
+                    self.detector.annotate(frame, detection),
+                )
+
+            self.previous_sequence = sequence
+            if observed_round is not None:
+                self.current_round = observed_round
+                self.current_round_date = local_date
+            self.last_result_at = utc_now()
+            self.first_successful_scan = False
+            self.no_result_attempts = 0
+            self._save_runtime_state("RUNNING", sequence)
+            return {
+                "status": "startup_baseline",
+                "round": self.current_round,
+                "sequence": sequence,
+                "recovered": recovered,
+            }
+
+        shift = find_sequence_shift(self.previous_sequence, sequence)
+        elapsed = (utc_now() - self.last_result_at).total_seconds()
+        recorded: list[int] = []
+        observed_round: Optional[int] = None
+        if self.current_round_date != local_date:
+            observed_round = self._read_round(frame)
+
+        if shift:
+            if self.current_round is None and observed_round is None:
+                observed_round = self._read_round(frame)
+            round_numbers = self._rounds_for_shift(shift, local_date, observed_round)
+            for code, round_number in zip(reversed(sequence[:shift]), round_numbers):
+                recorded.append(
+                    self._record_result(
+                        code,
+                        detection,
+                        frame,
+                        "sequence_shift" if shift == 1 else f"recovered_shift_{shift}",
+                        round_number,
+                        local_date,
+                    )
+                )
+            self.previous_sequence = sequence
+            self.no_result_attempts = 0
+        elif sequence == self.previous_sequence:
+            if observed_round is not None:
+                self.current_round = observed_round
+                self.current_round_date = local_date
+            if elapsed >= self.round_interval:
+                self.no_result_attempts += 1
+                if (
+                    len(set(sequence)) == 1
+                    and detection.new_marker_score >= 0.03
+                    and self.no_result_attempts == 1
+                ):
+                    confirmed_round = self._read_round(frame)
+                    start_round = (
+                        self.current_round + 1
+                        if self.current_round is not None
+                        and self.current_round_date == local_date
+                        else None
+                    )
+                    if (
+                        confirmed_round is not None
+                        and start_round is not None
+                        and 1 <= confirmed_round - self.current_round <= 4
+                    ):
+                        for round_number in range(start_round, confirmed_round + 1):
+                            recorded.append(
+                                self._record_result(
+                                    sequence[0],
+                                    detection,
+                                    frame,
+                                    "round_ocr_identical_sequence",
+                                    round_number,
+                                    local_date,
+                                )
+                            )
+                        self.no_result_attempts = 0
+                if self.no_result_attempts >= self.max_failed_attempts:
+                    self._notify_failure(
+                        "RESULT_TIMEOUT",
+                        "Quá 4 lần quét sau thời điểm dự kiến nhưng chưa thấy kèo mới",
+                        {
+                            "attempts": self.no_result_attempts,
+                            "elapsedSeconds": round(elapsed, 1),
+                            "round": self.current_round,
+                            "sequence": sequence,
+                            "newMarkerScore": detection.new_marker_score,
+                        },
+                        frame,
+                    )
+                    self.no_result_attempts = 0
+        else:
+            if observed_round is None:
+                observed_round = self._read_round(frame)
+            self._notify_failure(
+                "SEQUENCE_DESYNC",
+                "Chuỗi 8 ô thay đổi nhưng không khớp quy tắc dịch lịch sử",
+                {
+                    "previous": self.previous_sequence,
+                    "current": sequence,
+                    "observedRound": observed_round,
+                    "minimumConfidence": detection.minimum_confidence,
+                },
+                self.detector.annotate(frame, detection),
+            )
+            self.previous_sequence = sequence
+            self.last_result_at = utc_now()
+            self.no_result_attempts = 0
+            if observed_round is not None:
+                self.current_round = observed_round
+                self.current_round_date = local_date
+
+        self._save_runtime_state("RUNNING", self.previous_sequence)
+        return {
+            "status": "recorded" if recorded else "waiting",
+            "recordedIds": recorded,
+            "round": self.current_round,
             "sequence": sequence,
             "minimumConfidence": detection.minimum_confidence,
             "newMarkerScore": detection.new_marker_score,

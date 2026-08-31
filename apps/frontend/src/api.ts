@@ -1,30 +1,79 @@
 import type {
+  AiPredictionResponse,
+  AdminSession,
   AlertDelivery,
+  DailyStats,
+  DailySummary,
   Page,
+  PaymentConfig,
+  Prediction,
   ResultItem,
   ScannerEvent,
   ScannerStatus,
-  TodayStats,
+  Subscriber,
 } from './types'
 
 const configuredBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
 
-async function getJson<T>(path: string): Promise<T> {
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${configuredBase}${path}`, {
-    headers: { Accept: 'application/json' },
+    ...init,
+    credentials: 'include',
+    headers: {
+      Accept: 'application/json',
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...init?.headers,
+    },
     cache: 'no-store',
   })
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}: ${path}`)
+    let message = `${response.status} ${response.statusText}`
+    try {
+      const payload = await response.json() as { error?: string }
+      if (payload.error) message = payload.error
+    } catch {
+      // Keep the HTTP error when the response has no JSON body.
+    }
+    throw new Error(message)
   }
+  if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
 }
 
+const queryDate = (date: string) => encodeURIComponent(date)
+
 export const api = {
-  stats: () => getJson<TodayStats>('/api/stats/today'),
-  status: () => getJson<ScannerStatus>('/api/scanner/status'),
-  results: (page: number, pageSize: number) =>
-    getJson<Page<ResultItem>>(`/api/results?page=${page}&pageSize=${pageSize}`),
-  events: () => getJson<Page<ScannerEvent>>('/api/scanner/events?page=1&pageSize=20'),
-  alerts: () => getJson<AlertDelivery[]>('/api/alerts'),
+  adminSession: () => requestJson<AdminSession>('/api/auth/session'),
+  adminLogin: (username: string, password: string) =>
+    requestJson<AdminSession>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    }),
+  adminLogout: () => requestJson<void>('/api/auth/logout', { method: 'POST' }),
+  stats: (date: string) => requestJson<DailyStats>(`/api/stats/daily?date=${queryDate(date)}`),
+  days: () => requestJson<DailySummary[]>('/api/stats/days?limit=2'),
+  status: () => requestJson<ScannerStatus>('/api/scanner/status'),
+  results: (page: number, pageSize: number, date: string) =>
+    requestJson<Page<ResultItem>>(
+      `/api/results?page=${page}&pageSize=${pageSize}&date=${queryDate(date)}`,
+    ),
+  events: () => requestJson<Page<ScannerEvent>>('/api/scanner/events?page=1&pageSize=30'),
+  acknowledgeEvent: (id: number) =>
+    requestJson<void>(`/api/scanner/events/${id}/acknowledge`, { method: 'PATCH' }),
+  alerts: () => requestJson<AlertDelivery[]>('/api/alerts'),
+  prediction: (date: string) =>
+    requestJson<Prediction>(`/api/predictions/next?date=${queryDate(date)}`),
+  aiPrediction: (date: string, force = false) =>
+    requestJson<AiPredictionResponse>(`/api/predictions/ai?date=${queryDate(date)}&force=${force}`),
+  compoundPrediction: (date: string, force = false) =>
+    requestJson<AiPredictionResponse>(`/api/predictions/compound?date=${queryDate(date)}&force=${force}`),
+  paymentConfig: () => requestJson<PaymentConfig>('/api/payment/config'),
+  subscribers: () => requestJson<Subscriber[]>('/api/subscribers'),
+  registerSubscriber: (phoneNumber: string, displayName: string) =>
+    requestJson<Subscriber>('/api/subscribers', {
+      method: 'POST',
+      body: JSON.stringify({ phoneNumber, displayName: displayName || null }),
+    }),
+  deactivateSubscriber: (id: number) =>
+    requestJson<void>(`/api/subscribers/${id}`, { method: 'DELETE' }),
 }

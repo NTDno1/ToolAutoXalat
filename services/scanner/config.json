@@ -1,14 +1,14 @@
 {
   "emulator": {
     "adb_host": "127.0.0.1",
-    "adb_port": 5575,
+    "adb_port": 5555,
     "adb_path": "C:\\Users\\Admin\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
-    "window_title": "BlueStacks App Player 2",
+    "window_title": "",
     "output_width": 720,
-    "output_height": 1280
+    "output_height": 1500
   },
   "scanner": {
-    "scan_interval_seconds": 3,
+    "scan_interval_seconds": 1.5,
     "round_interval_seconds": 30,
     "max_failed_attempts": 4,
     "failure_alert_cooldown_seconds": 30,
@@ -16,20 +16,31 @@
   },
   "history": {
     "reference_width": 720,
-    "reference_height": 1280,
-    "slot_centers_x": [180, 247, 313, 380, 446, 512, 579, 646],
-    "slot_center_y": 1187,
-    "slot_half_size": 34,
-    "crop": {"x": 115, "y": 1135, "width": 585, "height": 95},
-    "new_marker": {"x": 163, "y": 1191, "width": 34, "height": 18}
+    "reference_height": 1500,
+    "slot_centers_x": [178, 242, 306, 370, 434, 498, 562, 626],
+    "slot_center_y": 1300,
+    "slot_half_size": 36,
+    "crop": {"x": 95, "y": 1245, "width": 600, "height": 110},
+    "new_marker": {"x": 157, "y": 1307, "width": 42, "height": 22}
+  },
+  "round": {
+    "reference_width": 720,
+    "reference_height": 1500,
+    "crop": {"x": 450, "y": 135, "width": 265, "height": 80},
+    "tesseract_path": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "minimum": 1,
+    "maximum": 999999,
+    "timezone": "Asia/Bangkok",
+    "day_boundary_hour": 23
   },
   "detection": {
-    "minimum_confidence": 0.58,
+    "minimum_confidence": 0.56,
     "minimum_margin": 0.035,
     "high_confidence_override": 0.82,
-    "template_scale_min": 0.65,
-    "template_scale_max": 1.55,
-    "template_scale_steps": 19
+    "template_scale_min": 0.85,
+    "template_scale_max": 1.5,
+    "template_scale_steps": 7,
+    "large_template_max_edge": 48
   },
   "paths": {
     "database": "../../data/greedy_stats.db",

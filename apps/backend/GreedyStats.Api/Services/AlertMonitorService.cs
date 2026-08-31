@@ -30,7 +30,8 @@ public sealed class AlertMonitorService : BackgroundService
         {
             try
             {
-                await EvaluateAsync(stoppingToken);
+                await EvaluateStreakAlertAsync(stoppingToken);
+                await EvaluateSystemEventAsync(stoppingToken);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
@@ -43,11 +44,12 @@ public sealed class AlertMonitorService : BackgroundService
         }
     }
 
-    private async Task EvaluateAsync(CancellationToken cancellationToken)
+    private async Task EvaluateStreakAlertAsync(CancellationToken cancellationToken)
     {
         var vegetableThreshold = _configuration.GetValue("Alerts:VegetableStreakThreshold", 15);
         var meatThreshold = _configuration.GetValue("Alerts:MeatStreakThreshold", 3);
-        var webhookUrl = _configuration["Alerts:WebhookUrl"]?.Trim();
+        var webhookUrl = (_configuration["Alerts:UserWebhookUrl"] ??
+                          _configuration["Alerts:WebhookUrl"])?.Trim();
         var candidate = await _database.GetCurrentAlertCandidateAsync(
             vegetableThreshold,
             meatThreshold,
@@ -57,29 +59,40 @@ public sealed class AlertMonitorService : BackgroundService
             return;
         }
 
-        var configured = !string.IsNullOrWhiteSpace(webhookUrl);
+        var subscribers = await _database.GetSubscribersAsync(true, cancellationToken);
+        var configured = !string.IsNullOrWhiteSpace(webhookUrl) && subscribers.Count > 0;
         var status = await _database.EnsureAlertAsync(candidate, configured, cancellationToken);
         if (!configured || status is "DELIVERED" or "FAILED")
         {
             return;
         }
 
+        var payload = new
+        {
+            type = "STREAK_ALERT",
+            deliveryMode = "BROADCAST",
+            recipientCount = subscribers.Count,
+            alert = candidate.Payload,
+            recipients = subscribers.Select(item => new
+            {
+                item.Id,
+                item.PhoneNumber,
+                item.DisplayName
+            })
+        };
         try
         {
             var client = _httpClientFactory.CreateClient("alert-webhook");
-            using var response = await client.PostAsJsonAsync(
-                webhookUrl,
-                candidate.Payload,
-                cancellationToken);
+            using var response = await client.PostAsJsonAsync(webhookUrl, payload, cancellationToken);
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             await _database.CompleteAlertAsync(
                 candidate.AlertKey,
                 response.IsSuccessStatusCode ? "DELIVERED" : "FAILED",
                 (int)response.StatusCode,
-                body.Length > 2000 ? body[..2000] : body,
+                Truncate(body),
                 cancellationToken);
             _logger.LogInformation(
-                "Webhook {AlertKey} completed with HTTP {StatusCode}",
+                "User webhook {AlertKey} completed with HTTP {StatusCode}",
                 candidate.AlertKey,
                 (int)response.StatusCode);
         }
@@ -89,9 +102,64 @@ public sealed class AlertMonitorService : BackgroundService
                 candidate.AlertKey,
                 "FAILED",
                 null,
-                exception.Message,
+                Truncate(exception.Message),
                 cancellationToken);
-            _logger.LogError(exception, "Webhook {AlertKey} failed", candidate.AlertKey);
+            _logger.LogError(exception, "User webhook {AlertKey} failed", candidate.AlertKey);
         }
     }
+
+    private async Task EvaluateSystemEventAsync(CancellationToken cancellationToken)
+    {
+        var candidate = await _database.GetNextSystemEventDeliveryAsync(cancellationToken);
+        if (candidate is null)
+        {
+            return;
+        }
+        var webhookUrl = _configuration["Alerts:AdminWebhookUrl"]?.Trim();
+        var configured = !string.IsNullOrWhiteSpace(webhookUrl);
+        var status = await _database.EnsureSystemEventDeliveryAsync(
+            candidate.EventId,
+            configured,
+            cancellationToken);
+        if (!configured || status is "DELIVERED" or "FAILED")
+        {
+            return;
+        }
+
+        var payload = new
+        {
+            type = "SCANNER_SYSTEM_EVENT",
+            eventId = candidate.EventId,
+            candidate.Severity,
+            candidate.EventCode,
+            candidate.Message,
+            candidate.Details,
+            candidate.OccurredAtUtc
+        };
+        try
+        {
+            var client = _httpClientFactory.CreateClient("alert-webhook");
+            using var response = await client.PostAsJsonAsync(webhookUrl, payload, cancellationToken);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            await _database.CompleteSystemEventDeliveryAsync(
+                candidate.EventId,
+                response.IsSuccessStatusCode ? "DELIVERED" : "FAILED",
+                (int)response.StatusCode,
+                Truncate(body),
+                cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await _database.CompleteSystemEventDeliveryAsync(
+                candidate.EventId,
+                "FAILED",
+                null,
+                Truncate(exception.Message),
+                cancellationToken);
+            _logger.LogError(exception, "Admin system-event webhook failed for event {EventId}", candidate.EventId);
+        }
+    }
+
+    private static string Truncate(string value) =>
+        value.Length > 2000 ? value[..2000] : value;
 }

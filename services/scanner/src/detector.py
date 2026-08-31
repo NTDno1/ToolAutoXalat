@@ -49,6 +49,16 @@ ITEMS: dict[str, dict[str, Any]] = {
         "category": "VEGETABLE",
         "templates": ["IconListChua.png", "iconChua.png"],
     },
+    "PIZZA": {
+        "name": "Nổ Pizza",
+        "category": "SPECIAL",
+        "templates": ["PizzaIcon.png"],
+    },
+    "SALAD": {
+        "name": "Nổ Xà lách",
+        "category": "SPECIAL",
+        "templates": ["SalatIcon.png"],
+    },
 }
 
 
@@ -99,11 +109,18 @@ class HistoryDetector:
         self.minimum_confidence = float(detection_config["minimum_confidence"])
         self.minimum_margin = float(detection_config["minimum_margin"])
         self.high_confidence_override = float(detection_config["high_confidence_override"])
-        self.scales = np.linspace(
+        self.large_template_max_edge = int(
+            detection_config.get("large_template_max_edge", 48)
+        )
+        configured_scales = np.linspace(
             float(detection_config["template_scale_min"]),
             float(detection_config["template_scale_max"]),
             int(detection_config["template_scale_steps"]),
         )
+        # Always retain the source icon at its native size. The configured
+        # linspace does not necessarily include 1.0, which previously reduced
+        # the score even when the on-screen Pizza/Salad icon was an exact match.
+        self.scales = np.unique(np.append(configured_scales, 1.0))
         self.templates = self._load_templates()
 
     def _load_templates(self) -> dict[str, list[np.ndarray]]:
@@ -115,7 +132,29 @@ class HistoryDetector:
                 path = self.template_dir / filename
                 image = cv2.imread(str(path), cv2.IMREAD_COLOR)
                 if image is not None:
-                    variants.append(image)
+                    longest_edge = max(image.shape[:2])
+                    if longest_edge > 96:
+                        scale = self.large_template_max_edge / longest_edge
+                        image = cv2.resize(
+                            image,
+                            None,
+                            fx=scale,
+                            fy=scale,
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    seen_shapes: set[tuple[int, int]] = set()
+                    for scale in self.scales:
+                        resized = cv2.resize(
+                            image,
+                            None,
+                            fx=float(scale),
+                            fy=float(scale),
+                            interpolation=cv2.INTER_CUBIC,
+                        )
+                        shape = resized.shape[:2]
+                        if shape not in seen_shapes:
+                            variants.append(resized)
+                            seen_shapes.add(shape)
             if not variants:
                 missing.extend(item["templates"])
             loaded[code] = variants
@@ -136,20 +175,12 @@ class HistoryDetector:
     def _best_template_score(self, slot: np.ndarray, variants: list[np.ndarray]) -> float:
         best = -1.0
         for template in variants:
-            for scale in self.scales:
-                resized = cv2.resize(
-                    template,
-                    None,
-                    fx=float(scale),
-                    fy=float(scale),
-                    interpolation=cv2.INTER_CUBIC,
-                )
-                if resized.shape[0] > slot.shape[0] or resized.shape[1] > slot.shape[1]:
-                    continue
-                score = float(
-                    cv2.matchTemplate(slot, resized, cv2.TM_CCOEFF_NORMED).max()
-                )
-                best = max(best, score)
+            if template.shape[0] > slot.shape[0] or template.shape[1] > slot.shape[1]:
+                continue
+            score = float(
+                cv2.matchTemplate(slot, template, cv2.TM_CCOEFF_NORMED).max()
+            )
+            best = max(best, score)
         return best
 
     def _classify_slot(

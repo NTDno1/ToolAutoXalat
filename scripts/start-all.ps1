@@ -60,6 +60,20 @@ $frontend = Start-Process -FilePath 'npm.cmd' `
     -RedirectStandardError (Join-Path $logDir 'frontend.stderr.log') `
     -PassThru
 
+$migrationDeadline = (Get-Date).AddSeconds(30)
+$backendMigrated = $false
+do {
+    try {
+        $health = Invoke-RestMethod -Uri 'http://127.0.0.1:5117/health' -TimeoutSec 2
+        $backendMigrated = $health.status -eq 'ok'
+    } catch { $backendMigrated = $false }
+    if (-not $backendMigrated) { Start-Sleep -Seconds 1 }
+} while ((Get-Date) -lt $migrationDeadline -and -not $backendMigrated)
+
+if (-not $backendMigrated) {
+    throw "Backend không sẵn sàng để migrate database trước khi chạy scanner."
+}
+
 $scanner = Start-Process -FilePath 'python' `
     -ArgumentList @('scanner.py') `
     -WorkingDirectory $scannerDir `
@@ -75,7 +89,7 @@ $state = [ordered]@{
     scannerPid = $scanner.Id
     backendUrl = 'http://127.0.0.1:5117'
     frontendUrl = 'http://127.0.0.1:5173'
-    emulator = '127.0.0.1:5575'
+    emulator = '127.0.0.1:5555'
 }
 $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8
 
