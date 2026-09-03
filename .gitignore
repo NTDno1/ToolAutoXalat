@@ -35,6 +35,7 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+!data/greedy_stats.db
 data/captures/
 logs/
 runtime/

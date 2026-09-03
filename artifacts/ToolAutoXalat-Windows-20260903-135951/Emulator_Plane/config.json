@@ -1,0 +1,58 @@
+{
+  "app": {
+    "name": "ToolAutoXalat - Emulator Plane",
+    "version": "1.0.0",
+    "mode": "auto_betting"
+  },
+  "emulator": {
+    "type": "bluestacks",
+    "adb_host": "127.0.0.1",
+    "adb_port": 5575,
+    "adb_path": "C:\\Users\\Admin\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+    "auto_connect": true,
+    "capture_method": "window",
+    "window_title": "BlueStacks App Player 2",
+    "normalize_capture_size": true
+  },
+  "game": {
+    "strategy_file": "strategies/sinh_ton_19.json",
+    "so_keo_rinh_moi": 8,
+    "stop_loss": 10186,
+    "min_timer_seconds": 5,
+    "time_schedule": {
+      "enabled": false,
+      "start": "08:00",
+      "end": "11:30"
+    }
+  },
+  "vision": {
+    "ocr_engine": "tesseract",
+    "tesseract_path": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "scan_interval_ms": 500,
+    "frame_diff_threshold": 30,
+    "roi": {
+      "timer": {"x": 180, "y": 320, "w": 80, "h": 40},
+      "history": {"x": 10, "y": 620, "w": 390, "h": 50},
+      "balance": {"x": 30, "y": 660, "w": 120, "h": 25}
+    },
+    "chips": {
+      "chip_10": {"x": 75, "y": 540},
+      "chip_50": {"x": 155, "y": 540},
+      "chip_100": {"x": 235, "y": 540},
+      "chip_1000": {"x": 315, "y": 540}
+    },
+    "bet_slots": {
+      "bo": {"x": 85, "y": 200},
+      "ga": {"x": 315, "y": 200},
+      "xien": {"x": 85, "y": 400},
+      "xuc_xich": {"x": 315, "y": 400}
+    }
+  },
+  "logging": {
+    "db_path": "data/game_log.db",
+    "log_level": "INFO",
+    "log_dir": "logs",
+    "save_screenshots": false,
+    "screenshot_dir": "data/screenshots"
+  }
+}

@@ -1,0 +1,5 @@
+numpy>=2.0,<3.0
+opencv-python>=4.10,<5.1
+Pillow>=10.0,<13.0
+requests>=2.32,<3.0
+pytesseract>=0.3.13,<0.4

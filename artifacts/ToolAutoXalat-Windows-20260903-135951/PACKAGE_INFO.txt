@@ -1,0 +1,13 @@
+﻿ToolAutoXalat portable Windows package
+Created: 2026-09-03T14:00:00.6311608+07:00
+SQLite integrity: ok
+Database results: 9552
+Database bytes: 9936896
+
+Excluded because they are machine-specific or regenerated:
+- .git, runtime process IDs, logs
+- node_modules, frontend dist, backend bin/obj
+- data/captures and old database backups
+
+Read MIGRATE_WINDOWS.md before starting on the new machine.
+This package can contain private admin/API configuration. Keep it private.

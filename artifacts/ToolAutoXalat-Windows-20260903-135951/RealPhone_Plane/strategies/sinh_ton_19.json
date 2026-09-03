@@ -1,0 +1,21 @@
+[
+  {"Round": 1, "Bo": 2, "Ga": 4, "Xien": 6, "Xuc": 10, "Cost": 22, "TotalCost": 22, "ProfitBo": 68, "ProfitGa": 78, "ProfitXien": 68, "ProfitXuc": 78},
+  {"Round": 2, "Bo": 2, "Ga": 4, "Xien": 6, "Xuc": 10, "Cost": 22, "TotalCost": 44, "ProfitBo": 46, "ProfitGa": 56, "ProfitXien": 46, "ProfitXuc": 56},
+  {"Round": 3, "Bo": 2, "Ga": 4, "Xien": 6, "Xuc": 10, "Cost": 22, "TotalCost": 66, "ProfitBo": 24, "ProfitGa": 34, "ProfitXien": 24, "ProfitXuc": 34},
+  {"Round": 4, "Bo": 4, "Ga": 8, "Xien": 12, "Xuc": 20, "Cost": 44, "TotalCost": 110, "ProfitBo": 70, "ProfitGa": 90, "ProfitXien": 70, "ProfitXuc": 90},
+  {"Round": 5, "Bo": 4, "Ga": 8, "Xien": 12, "Xuc": 20, "Cost": 44, "TotalCost": 154, "ProfitBo": 26, "ProfitGa": 46, "ProfitXien": 26, "ProfitXuc": 46},
+  {"Round": 6, "Bo": 6, "Ga": 12, "Xien": 18, "Xuc": 30, "Cost": 66, "TotalCost": 220, "ProfitBo": 50, "ProfitGa": 80, "ProfitXien": 50, "ProfitXuc": 80},
+  {"Round": 7, "Bo": 8, "Ga": 16, "Xien": 24, "Xuc": 40, "Cost": 88, "TotalCost": 308, "ProfitBo": 52, "ProfitGa": 92, "ProfitXien": 52, "ProfitXuc": 92},
+  {"Round": 8, "Bo": 10, "Ga": 20, "Xien": 30, "Xuc": 50, "Cost": 110, "TotalCost": 418, "ProfitBo": 32, "ProfitGa": 82, "ProfitXien": 32, "ProfitXuc": 82},
+  {"Round": 9, "Bo": 14, "Ga": 28, "Xien": 42, "Xuc": 70, "Cost": 154, "TotalCost": 572, "ProfitBo": 58, "ProfitGa": 128, "ProfitXien": 58, "ProfitXuc": 128},
+  {"Round": 10, "Bo": 18, "Ga": 36, "Xien": 54, "Xuc": 90, "Cost": 198, "TotalCost": 770, "ProfitBo": 40, "ProfitGa": 130, "ProfitXien": 40, "ProfitXuc": 130},
+  {"Round": 11, "Bo": 24, "Ga": 48, "Xien": 72, "Xuc": 120, "Cost": 264, "TotalCost": 1034, "ProfitBo": 46, "ProfitGa": 166, "ProfitXien": 46, "ProfitXuc": 166},
+  {"Round": 12, "Bo": 32, "Ga": 64, "Xien": 96, "Xuc": 160, "Cost": 352, "TotalCost": 1386, "ProfitBo": 54, "ProfitGa": 214, "ProfitXien": 54, "ProfitXuc": 214},
+  {"Round": 13, "Bo": 42, "Ga": 84, "Xien": 126, "Xuc": 210, "Cost": 462, "TotalCost": 1848, "ProfitBo": 42, "ProfitGa": 252, "ProfitXien": 42, "ProfitXuc": 252},
+  {"Round": 14, "Bo": 56, "Ga": 112, "Xien": 168, "Xuc": 280, "Cost": 616, "TotalCost": 2464, "ProfitBo": 56, "ProfitGa": 336, "ProfitXien": 56, "ProfitXuc": 336},
+  {"Round": 15, "Bo": 74, "Ga": 148, "Xien": 222, "Xuc": 370, "Cost": 814, "TotalCost": 3278, "ProfitBo": 52, "ProfitGa": 422, "ProfitXien": 52, "ProfitXuc": 422},
+  {"Round": 16, "Bo": 98, "Ga": 196, "Xien": 294, "Xuc": 490, "Cost": 1078, "TotalCost": 4356, "ProfitBo": 54, "ProfitGa": 544, "ProfitXien": 54, "ProfitXuc": 544},
+  {"Round": 17, "Bo": 130, "Ga": 260, "Xien": 390, "Xuc": 650, "Cost": 1430, "TotalCost": 5786, "ProfitBo": 64, "ProfitGa": 714, "ProfitXien": 64, "ProfitXuc": 714},
+  {"Round": 18, "Bo": 172, "Ga": 344, "Xien": 516, "Xuc": 860, "Cost": 1892, "TotalCost": 7678, "ProfitBo": 62, "ProfitGa": 922, "ProfitXien": 62, "ProfitXuc": 922},
+  {"Round": 19, "Bo": 228, "Ga": 456, "Xien": 684, "Xuc": 1140, "Cost": 2508, "TotalCost": 10186, "ProfitBo": 74, "ProfitGa": 1214, "ProfitXien": 74, "ProfitXuc": 1214}
+]
