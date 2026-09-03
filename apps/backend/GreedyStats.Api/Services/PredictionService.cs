@@ -1,6 +1,5 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
-using System.Globalization;
 using System.Text.Json;
 using GreedyStats.Api.Data;
 using GreedyStats.Api.Models;
@@ -105,6 +104,7 @@ public sealed class PredictionService
     {
         var settings = new AiChannelSettings(
             _configuration["Prediction:AiModel"]?.Trim() ?? "openai/gpt-oss-120b",
+            _configuration["Prediction:AiFallbackModel"]?.Trim() ?? "openai/gpt-oss-20b",
             _configuration["Prediction:AiApiKey"]?.Trim(),
             _configuration["Prediction:AiBaseUrl"]?.Trim() ?? "https://api.groq.com/openai/v1",
             _configuration["Prediction:AiRoute"]?.Trim() ?? "/chat/completions",
@@ -132,6 +132,7 @@ public sealed class PredictionService
         }
         var settings = new AiChannelSettings(
             _configuration["Prediction:CompoundModel"]?.Trim() ?? "groq/compound-mini",
+            _configuration["Prediction:CompoundFallbackModel"]?.Trim() ?? "openai/gpt-oss-20b",
             compoundApiKey,
             _configuration["Prediction:CompoundBaseUrl"]?.Trim() ??
                 _configuration["Prediction:AiBaseUrl"]?.Trim() ??
@@ -173,7 +174,7 @@ public sealed class PredictionService
         }
 
         var context = await GetContextAsync(localDate, cancellationToken);
-        var cacheKey = $"{context.LocalDate}:{context.History.LastOrDefault()?.Id ?? 0}:{settings.Model}";
+        var cacheKey = $"{context.LocalDate}:{context.History.LastOrDefault()?.Id ?? 0}:{settings.Model}:{settings.FallbackModel}";
         if (!forceRefresh && cache.Key == cacheKey && cache.Value is not null)
         {
             return cache.Value;
@@ -194,6 +195,22 @@ public sealed class PredictionService
                 settings.BaseUrl,
                 settings.Route,
                 cancellationToken);
+            if (ShouldUseFallback(result) &&
+                !string.IsNullOrWhiteSpace(settings.FallbackModel) &&
+                !string.Equals(settings.Model, settings.FallbackModel, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation(
+                    "AI model {Model} is unavailable or rate-limited; using fast fallback {FallbackModel}",
+                    settings.Model,
+                    settings.FallbackModel);
+                result = await RequestAiPredictionAsync(
+                    context,
+                    settings.FallbackModel,
+                    apiKey,
+                    settings.BaseUrl,
+                    settings.Route,
+                    cancellationToken);
+            }
             if (result.Status == "READY")
             {
                 cache.Key = cacheKey;
@@ -241,25 +258,6 @@ public sealed class PredictionService
         var currentCategory = currentSegment.LastOrDefault()?.Category;
         var currentStreak = CurrentCategoryStreak(currentSegment);
 
-        var allDaySourceSequences = fullHistory
-            .GroupBy(item => new
-            {
-                Date = item.RoundLocalDate ?? "UNKNOWN",
-                item.SourceSerial
-            })
-            .OrderBy(group => group.Key.Date)
-            .ThenBy(group => group.Key.SourceSerial)
-            .Select(group => new
-            {
-                d = group.Key.Date,
-                src = group.Key.SourceSerial,
-                firstRound = group.First().RoundNumber,
-                lastRound = group.Last().RoundNumber,
-                n = group.Count(),
-                q = string.Concat(group.Select(item =>
-                    CompactItemCodes.GetValueOrDefault(item.ItemCode, "?")))
-            })
-            .ToList();
         var dailyHistory = fullHistory
             .GroupBy(item => item.RoundLocalDate ?? "UNKNOWN")
             .OrderBy(group => group.Key)
@@ -367,126 +365,73 @@ public sealed class PredictionService
         var localBaseline = BuildHeuristic(context);
         var isCompoundModel = model.StartsWith(
             "groq/compound", StringComparison.OrdinalIgnoreCase);
-        var data = new
+        var requestData = new
         {
-            SchemaVersion = "full-db-compact-v1",
-            Objective = "Predict exactly the next regular item and its VEGETABLE/MEAT category",
-            context.LocalDate,
-            PayoutMultipliers,
-            Codebook = CompactItemCodes,
-            FullDatabase = new
+            v = "full-db-statistics-v3",
+            objective = "next regular item and VEGETABLE/MEAT category",
+            date = context.LocalDate,
+            payout = PayoutMultipliers,
+            full = new
             {
-                TotalResults = fullHistory.Count,
-                PredictableResults = eligibleHistory.Count,
-                DayCount = dailyHistory.Count,
-                SourceCount = fullHistory.Select(item => item.SourceSerial).Distinct().Count(),
-                EncodedResultCount = allDaySourceSequences.Sum(sequence => sequence.n),
-                DailyHistory = dailyHistory,
-                AllDaySourceSequences = allDaySourceSequences,
-                ItemTransitionCounts = itemTransitionCounts,
-                CategoryTransitionCounts = categoryTransitionCounts,
-                StreakSurvival = streakSurvival
+                analyzedRecords = fullHistory.Count,
+                predictableRecords = eligibleHistory.Count,
+                analyzedDays = dailyHistory.Count,
+                sourceCount = fullHistory.Select(item => item.SourceSerial).Distinct().Count(),
+                daily = dailyHistory,
+                itemTransitions = itemTransitionCounts,
+                categoryTransitions = categoryTransitionCounts,
+                streakSurvival
             },
-            CurrentContext = new
+            current = new
             {
-                Source = latestSource,
-                CurrentCategory = currentCategory,
-                CurrentCategoryStreak = currentStreak,
-                LatestSequence = string.Concat(currentCodes
+                source = latestSource,
+                category = currentCategory,
+                streak = currentStreak,
+                latest = string.Concat(currentCodes
                     .TakeLast(16)
                     .Select(code => CompactItemCodes[code])),
-                NgramEvidence = ngramEvidence,
-                RecentWindows = recentWindows,
-                context.TodayCounts
+                ngrams = ngramEvidence,
+                recent = recentWindows,
+                today = context.TodayCounts
             },
-            LocalBaseline = localBaseline.Items.Select(item => new
+            baseline = localBaseline.Items.Select(item => new
             {
-                item.ItemCode,
-                item.ProbabilityPercent,
-                item.SignalScore,
-                item.PatternMatches
+                code = item.ItemCode,
+                p = item.ProbabilityPercent,
+                score = item.SignalScore,
+                matches = item.PatternMatches
             })
         };
-        object requestData = data;
-        if (isCompoundModel)
-        {
-            // Compound can execute the statistical calculation itself. Send
-            // every encoded row but omit duplicated server-side aggregates to
-            // leave output headroom inside the free 8K TPM tier.
-            requestData = new
-            {
-                v = "full-db-compact-v2",
-                d = context.LocalDate,
-                payout = PayoutMultipliers,
-                codebook = CompactItemCodes,
-                db = new
-                {
-                    total = fullHistory.Count,
-                    predictable = eligibleHistory.Count,
-                    days = dailyHistory.Count,
-                    sources = fullHistory.Select(item => item.SourceSerial).Distinct().Count(),
-                    sequences = allDaySourceSequences
-                },
-                current = new
-                {
-                    source = latestSource,
-                    category = currentCategory,
-                    streak = currentStreak,
-                    latest = string.Concat(currentCodes
-                        .TakeLast(16)
-                        .Select(code => CompactItemCodes[code])),
-                    today = context.TodayCounts
-                },
-                baseline = localBaseline.Items.Select(item => new
-                {
-                    code = item.ItemCode,
-                    p = item.ProbabilityPercent,
-                    score = item.SignalScore,
-                    matches = item.PatternMatches
-                })
-            };
-        }
         var systemPrompt = isCompoundModel
             ? """
-                Statistical sequence forecast; use only the payload. db.sequences encodes EVERY DB row across all
-                23:00-23:00 business days, one codebook character per row. Derive statistics from the full sequences using
-                empirical Bayes, item/category Markov, n-gram 1-8, streak hazard, recency/regime drift, and baseline
-                agreement; use code execution if useful; avoid gambler's fallacy. analyzedRecords=db.total;
-                analyzedDays=db.days; algorithmsUsed has >=4 methods. Return eight unique items:
+                Fast statistical ensemble; use only the supplied full-database feature summary and do not call tools.
+                The backend has already calculated every daily count, transition, n-gram, streak-hazard and recency window
+                from all database rows. analyzedRecords=full.analyzedRecords; analyzedDays=full.analyzedDays.
+                Combine empirical Bayes, Markov, n-gram, streak hazard, recency drift and baseline agreement.
+                algorithmsUsed has >=4 methods. Return eight unique items:
                 CA_ROT,NGO,CAI,CA_CHUA,BANH_MI,XIEN,DUI,BO. Item probabilities sum 100; vegetable/meat sums match
-                their four items and total 100. Vietnamese numeric reasons. Final output is ONLY a JSON object with
+                their four items and total 100. Use very short Vietnamese numeric reasons. Output ONLY one JSON object with
                 keys analyzedRecords,analyzedDays,confidencePercent,vegetableProbabilityPercent,
                 meatProbabilityPercent,algorithmsUsed,methodNote,items; each item has itemCode,probabilityPercent,
-                reason. No wrapper, prose, Markdown, citations, or tool output.
+                reason. No wrapper, prose or Markdown.
                 """
             : """
-                You are a statistical sequence-forecasting engine. Use only the supplied database payload.
-                AllDaySourceSequences contains EVERY database row across EVERY business day (23:00-23:00),
-                encoded with Codebook at exactly one character per row. Do not analyze only the recent window.
-
-                Required analysis:
-                1. Empirical Bayesian frequency by day and full history with payout prior only as regularization.
-                2. Item Markov transitions and VEGETABLE/MEAT category transitions.
-                3. Conditional n-gram continuation for depths 1-8, weighted by depth and sample size.
-                4. Category streak survival/hazard at the current streak length.
-                5. Recency-decayed frequency over multiple windows and regime/day drift.
-                6. Cross-check against LocalBaseline and reduce confidence when evidence conflicts or samples are small.
-
-                Avoid gambler's-fallacy claims and do not invent evidence. Return conservative calibrated estimates.
-                Perform the analysis efficiently and reserve enough completion budget to emit the final JSON object.
-                analyzedRecords MUST equal FullDatabase.TotalResults and analyzedDays MUST equal FullDatabase.DayCount.
-                algorithmsUsed must list at least four algorithms actually considered.
+                Statistical sequence forecast using only the supplied full-database feature summary. The backend has
+                already calculated daily frequencies, item/category Markov transitions, n-grams 1-8, streak survival,
+                recency windows and a calibrated baseline from EVERY database row and every 23:00-23:00 business day.
+                Combine those signals; avoid gambler's fallacy. analyzedRecords MUST equal full.analyzedRecords and
+                analyzedDays MUST equal full.analyzedDays. algorithmsUsed lists at least four methods actually combined.
                 items must contain each of these exactly once: CA_ROT, NGO, CAI, CA_CHUA, BANH_MI, XIEN, DUI, BO.
                 The 8 item probabilityPercent values must be non-negative and sum to 100.
                 vegetableProbabilityPercent must equal the sum of the four vegetable items; meatProbabilityPercent
                 must equal the sum of the four meat items; those two values must sum to 100.
-                Write concise Vietnamese reasons tied to numeric evidence. Output only the required JSON schema.
+                Write very short Vietnamese reasons tied to numeric evidence. Output only one JSON object.
                 """;
         var requestPayload = new Dictionary<string, object?>
         {
             ["model"] = model,
             ["temperature"] = 0.1,
-            ["max_completion_tokens"] = isCompoundModel ? 6000 : 2500,
+            ["max_completion_tokens"] = 1000,
             ["response_format"] = AiResponseFormat,
             ["messages"] = new object[]
             {
@@ -515,21 +460,6 @@ public sealed class PredictionService
             var response = await SendProviderRequestAsync();
             try
             {
-                var retryAfter = GetRetryAfter(response);
-                if ((int)response.StatusCode == 429 &&
-                    retryAfter is { } wait &&
-                    wait > TimeSpan.Zero &&
-                    wait <= TimeSpan.FromSeconds(60))
-                {
-                    _logger.LogInformation(
-                        "AI model {Model} reached a temporary rate limit; retrying once after {RetrySeconds:F1}s",
-                        model,
-                        wait.TotalSeconds);
-                    response.Dispose();
-                    await Task.Delay(wait + TimeSpan.FromMilliseconds(300), cancellationToken);
-                    response = await SendProviderRequestAsync();
-                }
-
                 var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
                 if (!response.IsSuccessStatusCode)
                 {
@@ -570,6 +500,11 @@ public sealed class PredictionService
                 response.Dispose();
             }
         }
+        catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(exception, "AI prediction timed out for model {Model}", model);
+            return AiError(model, "AI API quá thời gian phản hồi.");
+        }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             _logger.LogWarning(exception, "AI prediction request failed for model {Model}", model);
@@ -580,32 +515,13 @@ public sealed class PredictionService
     private static AiPredictionResponseDto AiError(string model, string message) =>
         new("ERROR", true, model, null, message);
 
-    private static TimeSpan? GetRetryAfter(HttpResponseMessage response)
-    {
-        if (response.Headers.RetryAfter?.Delta is { } delta)
-        {
-            return delta;
-        }
-        if (response.Headers.RetryAfter?.Date is { } retryDate)
-        {
-            return retryDate - DateTimeOffset.UtcNow;
-        }
-        if (response.Headers.TryGetValues("retry-after", out var values))
-        {
-            foreach (var value in values)
-            {
-                if (double.TryParse(
-                    value,
-                    NumberStyles.Float,
-                    CultureInfo.InvariantCulture,
-                    out var seconds))
-                {
-                    return TimeSpan.FromSeconds(seconds);
-                }
-            }
-        }
-        return null;
-    }
+    private static bool ShouldUseFallback(AiPredictionResponseDto response) =>
+        response.Status != "READY" &&
+        (response.Message?.Contains("HTTP 413", StringComparison.OrdinalIgnoreCase) == true ||
+         response.Message?.Contains("HTTP 429", StringComparison.OrdinalIgnoreCase) == true ||
+         response.Message?.Contains("quá thời gian", StringComparison.OrdinalIgnoreCase) == true ||
+         response.Message?.Contains("JSON/schema", StringComparison.OrdinalIgnoreCase) == true ||
+         response.Message?.Contains("thiếu vật phẩm", StringComparison.OrdinalIgnoreCase) == true);
 
     private static string ExtractProviderError(string responseBody)
     {
@@ -652,6 +568,7 @@ public sealed class PredictionService
             "CHẾ ĐỘ TEST NỘI BỘ: mô phỏng response AI từ toàn bộ database để kiểm tra giao diện và luồng tích hợp; chưa gọi GPT thật.",
             baseline.Items.Select(item => new AiModelItem(
                 item.ItemCode,
+                null,
                 Math.Pow(Math.Max(item.ProbabilityPercent, 0.01), 1.06),
                 $"TEST · {item.Reason}"))
             .ToList());
@@ -730,8 +647,8 @@ public sealed class PredictionService
             return null;
         }
         var grouped = output.Items
-            .Where(item => !string.IsNullOrWhiteSpace(item.ItemCode))
-            .GroupBy(item => item.ItemCode.Trim().ToUpperInvariant())
+            .Where(item => !string.IsNullOrWhiteSpace(item.EffectiveItemCode))
+            .GroupBy(item => item.EffectiveItemCode.Trim().ToUpperInvariant())
             .ToDictionary(group => group.Key, group => group.ToList());
         if (PayoutMultipliers.Keys.Any(code => !grouped.TryGetValue(code, out var values) || values.Count != 1) ||
             grouped.Keys.Any(code => !PayoutMultipliers.ContainsKey(code)))
@@ -847,12 +764,18 @@ public sealed class PredictionService
         IReadOnlyList<AiModelItem>? Items);
 
     private sealed record AiModelItem(
-        string ItemCode,
+        string? ItemCode,
+        string? Code,
         double ProbabilityPercent,
-        string? Reason);
+        string? Reason)
+    {
+        public string EffectiveItemCode =>
+            !string.IsNullOrWhiteSpace(ItemCode) ? ItemCode : Code ?? string.Empty;
+    }
 
     private sealed record AiChannelSettings(
         string Model,
+        string? FallbackModel,
         string? ApiKey,
         string BaseUrl,
         string Route,

@@ -9,6 +9,10 @@ if (-not (Test-Path -LiteralPath $statePath)) {
 
 $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
 
+if ($state.scannerTaskName) {
+    Stop-ScheduledTask -TaskName $state.scannerTaskName -ErrorAction SilentlyContinue
+}
+
 function Stop-ProjectTree([int]$ProcessId) {
     $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
     if (-not $process) { return }

@@ -8,8 +8,10 @@ if (Test-Path -LiteralPath $statePath) {
     foreach ($entry in @(
         @{ Name = 'Backend'; Pid = $state.backendPid },
         @{ Name = 'Frontend'; Pid = $state.frontendPid },
-        @{ Name = 'Scanner'; Pid = $state.scannerPid }
+        @{ Name = 'Scanner'; Pid = $state.scannerPid },
+        @{ Name = 'Cloudflare'; Pid = $state.cloudflaredPid }
     )) {
+        if (-not $entry.Pid) { continue }
         $process = Get-Process -Id $entry.Pid
         $rows += [pscustomobject]@{
             Service = $entry.Name

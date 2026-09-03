@@ -110,6 +110,7 @@ const viewports = [
   { width: 360, height: 800 },
   { width: 390, height: 844 },
   { width: 430, height: 932 },
+  { width: 1366, height: 768 },
 ]
 const checks = []
 
@@ -139,10 +140,62 @@ try {
       predictionPanels: document.querySelectorAll('.prediction-panel').length,
       predictionCards: document.querySelectorAll('.prediction-item').length,
       tableColumns: document.querySelectorAll('table thead th').length,
+      hasPagination: document.querySelector('.pagination') !== null,
+      hasStreakChatLaunch: document.querySelector('.streak-chat-launch') !== null,
       hasGlobalHorizontalOverflow: document.documentElement.scrollWidth > window.innerWidth + 1
     }))()`)
     const topScreenshot = await screenshot(`responsive_${viewport.width}_top.png`)
     checks.push({ ...viewport, ...metrics, topScreenshot })
+
+    if (viewport.width === 1366) {
+      const datePicker = await evaluate(`(() => {
+        const input = document.querySelector('#statistics-date')
+        const label = document.querySelector('.date-picker')
+        window.__datePickerOpenCount = 0
+        Object.defineProperty(input, 'showPicker', { configurable: true, value: () => { window.__datePickerOpenCount++ } })
+        label.querySelector('.date-picker-icon')?.click()
+        label.querySelector('.date-picker-copy')?.click()
+        label.querySelector('.date-picker-chevron')?.click()
+        label.click()
+        label.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+        return { openCount: window.__datePickerOpenCount, allAreasOpen: window.__datePickerOpenCount === 5 }
+      })()`)
+      checks.push({ section: 'desktop-date-picker', ...datePicker })
+      await evaluate("document.querySelector('.results-panel')?.scrollIntoView({ block: 'start' })")
+      await delay(250)
+      const firstPageRound = await evaluate("document.querySelector('.results-panel tbody .round-cell')?.textContent ?? ''")
+      const pageBefore = await evaluate("document.querySelector('.pagination span')?.textContent ?? ''")
+      await evaluate("document.querySelector('.pagination button:last-child')?.click()")
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const pageAfter = await evaluate("document.querySelector('.pagination span')?.textContent ?? ''")
+        if (pageAfter !== pageBefore) break
+        await delay(100)
+      }
+      await delay(200)
+      const desktopPagination = await evaluate(`(() => ({
+        pageBefore: ${JSON.stringify(pageBefore)},
+        pageAfter: document.querySelector('.pagination span')?.textContent ?? '',
+        firstPageRound: ${JSON.stringify(firstPageRound)},
+        secondPageRound: document.querySelector('.results-panel tbody .round-cell')?.textContent ?? '',
+        rows: document.querySelectorAll('.results-panel tbody tr').length,
+        hasInfiniteStatus: document.querySelector('.infinite-results-status') !== null
+      }))()`)
+      checks.push({ section: 'desktop-pagination', ...desktopPagination, screenshot: await screenshot('responsive_1366_database.png') })
+      await evaluate("document.querySelector('.streak-chat-launch')?.click()")
+      await delay(200)
+      const desktopChat = await evaluate(`(() => {
+        const panel = document.querySelector('.streak-chat-modal')?.getBoundingClientRect()
+        return {
+          panelWidth: Math.round(panel?.width ?? 0),
+          panelHeight: Math.round(panel?.height ?? 0),
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          closeVisible: document.querySelector('.streak-chat-close') !== null
+        }
+      })()`)
+      checks.push({ section: 'streak-chat-desktop', ...desktopChat, screenshot: await screenshot('responsive_1366_streak_chat.png') })
+      await evaluate("document.querySelector('.streak-chat-close')?.click()")
+    }
 
     if (viewport.width === 390) {
       await evaluate("document.querySelector('.local-prediction-panel')?.scrollIntoView({block:'start'})")
@@ -175,6 +228,57 @@ try {
       await evaluate("document.querySelector('.table-wrap')?.scrollIntoView({block:'start'})")
       await delay(400)
       checks.push({ section: 'database', screenshot: await screenshot('responsive_390_database.png') })
+      const initialRows = await evaluate("document.querySelectorAll('.results-infinite-scroll tbody tr').length")
+      await evaluate("(() => { const target = document.querySelector('.results-infinite-scroll'); if (target) target.scrollTop = target.scrollHeight })()")
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const loadedRows = await evaluate("document.querySelectorAll('.results-infinite-scroll tbody tr').length")
+        if (loadedRows > initialRows) break
+        await delay(200)
+      }
+      const loadedRows = await evaluate("document.querySelectorAll('.results-infinite-scroll tbody tr').length")
+      checks.push({ section: 'infinite-scroll', initialRows, loadedRows, loadedMore: loadedRows > initialRows })
+      await evaluate("document.querySelector('.streak-grid .bucket-grid button')?.click()")
+      for (let attempt = 0; attempt < 30; attempt++) {
+        const ready = await evaluate("document.querySelector('.streak-detail-loading') === null && document.querySelectorAll('.streak-detail-modal .streak-chat-bubble').length > 0")
+        if (ready) break
+        await delay(100)
+      }
+      await evaluate("document.querySelector('.streak-detail-modal .streak-chat-bubble')?.click()")
+      await delay(180)
+      const bucketDetail = await evaluate(`(() => ({
+        dialogOpen: document.querySelector('.streak-detail-modal') !== null,
+        bubbles: document.querySelectorAll('.streak-detail-modal .streak-chat-bubble').length,
+        expanded: document.querySelector('.streak-detail-modal [aria-expanded="true"]') !== null,
+        itemDetails: document.querySelectorAll('.streak-detail-modal .run-item-detail').length,
+        title: document.querySelector('.streak-detail-modal h2')?.textContent ?? ''
+      }))()`)
+      checks.push({ section: 'bucket-detail', ...bucketDetail, screenshot: await screenshot('responsive_390_bucket_detail.png') })
+      await evaluate("document.querySelector('.streak-modal .close-button')?.click()")
+      await evaluate("(() => { const target = document.querySelector('.results-infinite-scroll'); if (target) target.scrollTop = 0 })()")
+      await evaluate("document.querySelector('.streak-chat-launch')?.click()")
+      await delay(250)
+      const streakChatState = await evaluate(`(() => ({
+        bubbles: document.querySelectorAll('.streak-chat-bubble').length,
+        itemDetails: document.querySelectorAll('.run-item-detail').length,
+        panelHeight: Math.round(document.querySelector('.streak-chat-modal')?.getBoundingClientRect().height ?? 0),
+        viewportHeight: window.innerHeight,
+        closeVisible: (() => { const node = document.querySelector('.streak-chat-close'); if (!node) return false; const box = node.getBoundingClientRect(); return box.top >= 0 && box.bottom <= window.innerHeight })(),
+        summary: Array.from(document.querySelectorAll('.streak-chat-bubble')).slice(0, 4).map(node => node.textContent)
+      }))()`)
+      checks.push({
+        section: 'streak-chat',
+        ...streakChatState,
+        screenshot: await screenshot('responsive_390_streak_chat.png'),
+      })
+      await evaluate("document.querySelector('.streak-chat-backdrop')?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))")
+      await delay(100)
+      const closedByOutside = await evaluate("document.querySelector('.streak-chat-modal') === null")
+      await evaluate("document.querySelector('.streak-chat-launch')?.click()")
+      await delay(100)
+      await evaluate("document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
+      await delay(100)
+      const closedByEscape = await evaluate("document.querySelector('.streak-chat-modal') === null")
+      checks.push({ section: 'streak-chat-close', closedByOutside, closedByEscape })
     }
   }
   process.stdout.write(`${JSON.stringify(checks, null, 2)}\n`)

@@ -28,7 +28,7 @@ SRC_DIR = PROJECT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from bluestacks_capture import BlueStacksWindowCapture  # noqa: E402
+from bluestacks_capture import TimedBlueStacksWindowCapture  # noqa: E402
 from database import ScannerDatabase, utc_now  # noqa: E402
 from detector import (  # noqa: E402
     DetectionError,
@@ -37,6 +37,7 @@ from detector import (  # noqa: E402
     ITEMS,
     find_sequence_shift,
 )
+from popup_detector import is_result_popup  # noqa: E402
 from round_detector import RoundDetectionError, RoundDetector  # noqa: E402
 
 
@@ -49,29 +50,48 @@ class BlueStacksFrameSource:
         self.adb_path = config["adb_path"]
         self.serial = f"{self.adb_host}:{self.adb_port}"
         self.output_size = (int(config["output_width"]), int(config["output_height"]))
-        self.window_capture = BlueStacksWindowCapture(
+        self.window_capture = TimedBlueStacksWindowCapture(
             adb_port=self.adb_port,
             window_title=config.get("window_title", ""),
+            timeout_seconds=float(config.get("capture_timeout_seconds", 5)),
         )
 
     def connect(self) -> None:
-        result = subprocess.run(
-            [self.adb_path, "connect", self.serial],
-            capture_output=True,
-            text=True,
-            timeout=10,
+        last_error = "unknown ADB error"
+        for attempt in range(1, 4):
+            try:
+                result = subprocess.run(
+                    [self.adb_path, "connect", self.serial],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                output = (result.stdout + result.stderr).strip()
+                if result.returncode != 0 or "connected" not in output.lower():
+                    raise RuntimeError(output or f"exit code {result.returncode}")
+
+                # BlueStacks can list the device while `adb shell` remains
+                # blocked. Capture uses Win32 PrintWindow, so get-state is the
+                # non-invasive readiness check we actually need here.
+                probe = subprocess.run(
+                    [self.adb_path, "-s", self.serial, "get-state"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if probe.returncode == 0 and probe.stdout.strip() == "device":
+                    return
+                raise RuntimeError(
+                    (probe.stdout + probe.stderr).strip()
+                    or f"get-state exit code {probe.returncode}"
+                )
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                last_error = str(exc)
+                if attempt < 3:
+                    time.sleep(2)
+        raise RuntimeError(
+            f"ADB connection failed for {self.serial} after 3 attempts: {last_error}"
         )
-        output = (result.stdout + result.stderr).strip()
-        if result.returncode != 0 or "connected" not in output.lower():
-            raise RuntimeError(f"ADB connect failed for {self.serial}: {output}")
-        probe = subprocess.run(
-            [self.adb_path, "-s", self.serial, "shell", "echo", "scanner-ready"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if probe.returncode != 0 or "scanner-ready" not in probe.stdout:
-            raise RuntimeError(f"ADB probe failed for {self.serial}")
 
     def capture(self) -> np.ndarray:
         frame = self.window_capture.capture()
@@ -118,11 +138,42 @@ class GreedyScanner:
         )
 
         scanner = self.config["scanner"]
-        self.scan_interval = float(scanner["scan_interval_seconds"])
+        self.scan_interval = max(0.25, float(scanner["scan_interval_seconds"]))
+        self.post_popup_scan_interval = max(
+            0.15,
+            min(
+                self.scan_interval,
+                float(
+                    scanner.get(
+                        "post_popup_scan_interval_seconds", self.scan_interval
+                    )
+                ),
+            ),
+        )
+        self.post_popup_fast_window = max(
+            0.0, float(scanner.get("post_popup_fast_window_seconds", 0))
+        )
         self.round_interval = float(scanner["round_interval_seconds"])
         self.max_failed_attempts = int(scanner["max_failed_attempts"])
         self.failure_cooldown = float(scanner["failure_alert_cooldown_seconds"])
         self.save_result_crops = bool(scanner.get("save_result_crops", True))
+        self.max_error_captures = max(
+            0, int(scanner.get("max_error_captures", 100))
+        )
+
+        popup = self.config.get("popup_dismiss", {})
+        self.popup_dismiss_config = popup
+        self.popup_dismiss_enabled = bool(popup.get("enabled", False))
+        self.popup_input_serial = str(
+            popup.get("input_serial", self.frame_source.serial)
+        )
+        self.popup_tap_x = int(popup.get("tap_x", self.frame_source.output_size[0] // 2))
+        self.popup_tap_y = int(popup.get("tap_y", self.frame_source.output_size[1] // 2))
+        self.popup_cooldown = max(0.0, float(popup.get("cooldown_seconds", 8)))
+        self.popup_result_grace = max(
+            0.0, float(popup.get("result_grace_seconds", 12))
+        )
+        self.last_popup_dismiss_monotonic = 0.0
 
         backend = self.config["backend"]
         self.backend_url = backend["base_url"].rstrip("/")
@@ -140,6 +191,51 @@ class GreedyScanner:
         self.round_failures = 0
         self.no_result_attempts = 0
         self.last_alert_at: dict[str, datetime] = {}
+
+    def _dismiss_result_popup(self, frame: np.ndarray) -> bool:
+        if not self.popup_dismiss_enabled or not is_result_popup(
+            frame, self.popup_dismiss_config
+        ):
+            return False
+
+        now = time.monotonic()
+        if now - self.last_popup_dismiss_monotonic < self.popup_cooldown:
+            return False
+
+        try:
+            result = subprocess.run(
+                [
+                    self.frame_source.adb_path,
+                    "-s",
+                    self.popup_input_serial,
+                    "shell",
+                    "input",
+                    "tap",
+                    str(self.popup_tap_x),
+                    str(self.popup_tap_y),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode != 0:
+                self.logger.warning(
+                    "Popup detected but ADB dismiss failed: %s",
+                    (result.stdout + result.stderr).strip() or result.returncode,
+                )
+                return False
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.logger.warning("Popup detected but ADB dismiss failed: %s", exc)
+            return False
+
+        self.last_popup_dismiss_monotonic = now
+        self.logger.info(
+            "RESULT_POPUP_DISMISSED serial=%s tap=(%s,%s)",
+            self.popup_input_serial,
+            self.popup_tap_x,
+            self.popup_tap_y,
+        )
+        return True
 
     def _resolve(self, value: str) -> Path:
         path = Path(value)
@@ -265,12 +361,30 @@ class GreedyScanner:
             return [None] * shift
         return list(range(end_round - shift + 1, end_round + 1))
 
+    def _prune_error_captures(self) -> None:
+        if self.max_error_captures <= 0:
+            return
+        files = sorted(
+            self.capture_dir.glob("error_*.png"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in files[self.max_error_captures :]:
+            try:
+                path.unlink()
+            except OSError as exc:
+                self.logger.warning("Could not prune debug capture %s: %s", path, exc)
+
     def _save_debug_frame(self, frame: Optional[np.ndarray], prefix: str) -> Optional[str]:
-        if frame is None:
+        if frame is None or self.max_error_captures <= 0:
             return None
+        self._prune_error_captures()
         timestamp = utc_now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         path = self.capture_dir / f"{prefix}_{timestamp}.png"
-        cv2.imwrite(str(path), frame)
+        if not cv2.imwrite(str(path), frame):
+            self.logger.warning("Could not write debug capture %s", path)
+            return None
+        self._prune_error_captures()
         return str(path)
 
     def _send_backend_event(self, event_id: int, payload: dict) -> None:
@@ -353,14 +467,17 @@ class GreedyScanner:
             round_local_date=round_local_date,
             detected_at=detected_at,
         )
-        self._save_result_crop(frame, result_id)
         self.last_result_at = detected_at
         if round_number is not None:
             self.current_round = round_number
             self.current_round_date = round_local_date
+        # Publish the committed row immediately. Saving the optional evidence
+        # crop is not required by the dashboard and must not hold back its
+        # realtime change signal.
         self.database.set_state(
             "last_result_id", str(result_id)
         )
+        self._save_result_crop(frame, result_id)
         self.logger.info(
             "NEW RESULT id=%s round=%s item=%s category=%s confidence=%.3f reason=%s",
             result_id,
@@ -376,9 +493,22 @@ class GreedyScanner:
         frame: Optional[np.ndarray] = None
         try:
             frame = self.frame_source.capture()
+            # Detect and dismiss the result dialog before running the much
+            # heavier eight-slot matcher. This exposes the updated history row
+            # roughly one full detection pass earlier.
+            if self._dismiss_result_popup(frame):
+                self.capture_failures = 0
+                self.no_result_attempts = 0
+                self._save_runtime_state("POPUP_DISMISSED")
+                return {"status": "popup_dismissed"}
             detection = self.detector.detect(frame)
             self.capture_failures = 0
         except (RuntimeError, DetectionError, OSError) as exc:
+            if frame is not None and self._dismiss_result_popup(frame):
+                self.capture_failures = 0
+                self.no_result_attempts = 0
+                self._save_runtime_state("POPUP_DISMISSED")
+                return {"status": "popup_dismissed"}
             self.capture_failures += 1
             self._save_runtime_state("DETECTION_RETRY")
             self.logger.warning(
@@ -475,7 +605,11 @@ class GreedyScanner:
                         )
                     )
                     self.no_result_attempts = 0
-                elif self.no_result_attempts >= self.max_failed_attempts:
+                elif (
+                    self.no_result_attempts >= self.max_failed_attempts
+                    and elapsed >= self.round_interval + self.max_failed_attempts * self.scan_interval
+                    and time.monotonic() - self.last_popup_dismiss_monotonic >= self.popup_result_grace
+                ):
                     self._notify_failure(
                         "RESULT_TIMEOUT",
                         "Quá 4 lần quét sau thời điểm dự kiến nhưng chưa thấy kèo mới",
@@ -518,9 +652,22 @@ class GreedyScanner:
         frame: Optional[np.ndarray] = None
         try:
             frame = self.frame_source.capture()
+            # The popup hides the complete history strip. Dismiss it before
+            # template matching and temporarily enter the fast scan cadence so
+            # the first fully visible eight-slot frame is persisted at once.
+            if self._dismiss_result_popup(frame):
+                self.capture_failures = 0
+                self.no_result_attempts = 0
+                self._save_runtime_state("POPUP_DISMISSED")
+                return {"status": "popup_dismissed"}
             detection = self.detector.detect(frame)
             self.capture_failures = 0
         except (RuntimeError, DetectionError, OSError) as exc:
+            if frame is not None and self._dismiss_result_popup(frame):
+                self.capture_failures = 0
+                self.no_result_attempts = 0
+                self._save_runtime_state("POPUP_DISMISSED")
+                return {"status": "popup_dismissed"}
             self.capture_failures += 1
             self._save_runtime_state("DETECTION_RETRY")
             self.logger.warning(
@@ -687,7 +834,11 @@ class GreedyScanner:
                                 )
                             )
                         self.no_result_attempts = 0
-                if self.no_result_attempts >= self.max_failed_attempts:
+                if (
+                    self.no_result_attempts >= self.max_failed_attempts
+                    and elapsed >= self.round_interval + self.max_failed_attempts * self.scan_interval
+                    and time.monotonic() - self.last_popup_dismiss_monotonic >= self.popup_result_grace
+                ):
                     self._notify_failure(
                         "RESULT_TIMEOUT",
                         "Quá 4 lần quét sau thời điểm dự kiến nhưng chưa thấy kèo mới",
@@ -741,19 +892,36 @@ class GreedyScanner:
             {"serial": self.frame_source.serial, "intervalSeconds": self.scan_interval},
         )
         self.logger.info(
-            "Connected to %s; background scan interval %.1fs",
+            "Connected to %s; scan interval %.2fs, post-popup %.2fs for %.1fs",
             self.frame_source.serial,
             self.scan_interval,
+            self.post_popup_scan_interval,
+            self.post_popup_fast_window,
         )
         self._save_runtime_state("STARTING")
         while not self.stop_requested:
             started = time.monotonic()
-            self.scan_once()
+            outcome = self.scan_once()
+            elapsed = time.monotonic() - started
+            if outcome.get("status") in {"popup_dismissed", "recorded"}:
+                self.logger.info(
+                    "SCAN_TIMING status=%s duration_ms=%d",
+                    outcome["status"],
+                    round(elapsed * 1000),
+                )
             if once:
                 break
-            remaining = self.scan_interval - (time.monotonic() - started)
+            interval = self.scan_interval
+            if (
+                self.last_popup_dismiss_monotonic > 0
+                and time.monotonic() - self.last_popup_dismiss_monotonic
+                < self.post_popup_fast_window
+            ):
+                interval = self.post_popup_scan_interval
+            remaining = interval - (time.monotonic() - started)
             if remaining > 0:
                 time.sleep(remaining)
+        self.frame_source.window_capture.close()
         self._save_runtime_state("STOPPED")
         return 0
 

@@ -227,6 +227,35 @@ public sealed class GreedyDatabase
     public Task<TodayStatsDto> GetTodayStatsAsync(CancellationToken cancellationToken = default) =>
         GetStatsForDateAsync(LocalToday, cancellationToken);
 
+    public async Task<CompactTodayStatsDto> GetCompactStatsForDateAsync(
+        DateOnly localDate,
+        CancellationToken cancellationToken = default)
+    {
+        var stats = await GetStatsForDateAsync(localDate, cancellationToken);
+        return new CompactTodayStatsDto(
+            stats.LocalDate,
+            stats.TotalResults,
+            stats.RoundCount,
+            stats.MissedRoundCount,
+            stats.VegetableCount,
+            stats.MeatCount,
+            stats.SpecialCount,
+            stats.CurrentVegetableStreak,
+            stats.CurrentMeatStreak,
+            stats.LongestVegetableStreak,
+            stats.LongestMeatStreak,
+            stats.ItemCounts,
+            stats.VegetableRuns.Select(ToRunSummary).ToList(),
+            stats.MeatRuns.Select(ToRunSummary).ToList(),
+            stats.VegetableStreakBuckets
+                .Select(bucket => new StreakBucketSummaryDto(bucket.Length, bucket.Count))
+                .ToList(),
+            stats.MeatStreakBuckets
+                .Select(bucket => new StreakBucketSummaryDto(bucket.Length, bucket.Count))
+                .ToList(),
+            stats.LatestResult);
+    }
+
     public async Task<TodayStatsDto> GetStatsForDateAsync(
         DateOnly localDate,
         CancellationToken cancellationToken = default)
@@ -503,11 +532,12 @@ public sealed class GreedyDatabase
     {
         var stats = await GetTodayStatsAsync(cancellationToken);
         var latest = stats.LatestResult;
-        if (latest is null || latest.Category == "SPECIAL")
+        if (latest is null)
         {
             return null;
         }
-        var isVegetable = latest.Category == "VEGETABLE";
+        var streakCategory = GetStreakCategory(latest);
+        var isVegetable = streakCategory == "VEGETABLE";
         var streak = isVegetable ? stats.CurrentVegetableStreak : stats.CurrentMeatStreak;
         var threshold = isVegetable ? vegetableThreshold : meatThreshold;
         if (streak < threshold)
@@ -522,7 +552,7 @@ public sealed class GreedyDatabase
         {
             alertKey,
             ruleCode = rule,
-            category = latest.Category,
+            category = streakCategory,
             streakLength = streak,
             threshold,
             resultId = latest.Id,
@@ -533,7 +563,7 @@ public sealed class GreedyDatabase
             localDate = stats.LocalDate
         });
         return new AlertCandidate(
-            alertKey, rule, latest.Category, streak, latest.Id, payload);
+            alertKey, rule, streakCategory, streak, latest.Id, payload);
     }
 
     public async Task<string> EnsureAlertAsync(
@@ -835,7 +865,7 @@ public sealed class GreedyDatabase
 
     private static bool CanContinueRun(ResultDto previous, ResultDto current)
     {
-        if (current.Category != previous.Category ||
+        if (GetStreakCategory(current) != GetStreakCategory(previous) ||
             current.SourceSerial != previous.SourceSerial)
         {
             return false;
@@ -866,7 +896,7 @@ public sealed class GreedyDatabase
             .ToList();
 
         return new StreakRunDto(
-            end.Category,
+            GetStreakCategory(end),
             results.Count,
             start.Id,
             end.Id,
@@ -876,6 +906,23 @@ public sealed class GreedyDatabase
             end.DetectedAtUtc,
             items);
     }
+
+    private static StreakRunSummaryDto ToRunSummary(StreakRunDto run) => new(
+        run.Category,
+        run.Length,
+        run.StartResultId,
+        run.EndResultId,
+        run.StartRound,
+        run.EndRound,
+        run.StartedAtUtc,
+        run.EndedAtUtc);
+
+    private static string GetStreakCategory(ResultDto result) => result.ItemCode switch
+    {
+        "SALAD" => "VEGETABLE",
+        "PIZZA" => "MEAT",
+        _ => result.Category
+    };
 
     private (DateTime StartUtc, DateTime EndUtc) GetUtcRange(DateOnly localDate)
     {

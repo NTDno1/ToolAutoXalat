@@ -4,20 +4,39 @@
     "adb_port": 5555,
     "adb_path": "C:\\Users\\Admin\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
     "window_title": "",
+    "capture_timeout_seconds": 5,
     "output_width": 720,
     "output_height": 1500
   },
   "scanner": {
-    "scan_interval_seconds": 1.5,
+    "scan_interval_seconds": 0.5,
+    "post_popup_scan_interval_seconds": 0.25,
+    "post_popup_fast_window_seconds": 8,
     "round_interval_seconds": 30,
     "max_failed_attempts": 4,
     "failure_alert_cooldown_seconds": 30,
-    "save_result_crops": true
+    "save_result_crops": true,
+    "max_error_captures": 100
+  },
+  "popup_dismiss": {
+    "enabled": true,
+    "input_serial": "emulator-5554",
+    "tap_x": 360,
+    "tap_y": 750,
+    "cooldown_seconds": 8,
+    "result_grace_seconds": 12,
+    "reference_width": 720,
+    "reference_height": 1500,
+    "max_dim_brightness": 135,
+    "bright_pixel_min": 200,
+    "min_dialog_bright_fraction": 0.35,
+    "dim_region": {"x": 45, "y": 120, "width": 630, "height": 110},
+    "dialog_region": {"x": 0, "y": 850, "width": 720, "height": 650}
   },
   "history": {
     "reference_width": 720,
     "reference_height": 1500,
-    "slot_centers_x": [178, 242, 306, 370, 434, 498, 562, 626],
+    "slot_centers_x": [178, 244, 310, 376, 442, 508, 574, 640],
     "slot_center_y": 1300,
     "slot_half_size": 36,
     "crop": {"x": 95, "y": 1245, "width": 600, "height": 110},
@@ -37,9 +56,10 @@
     "minimum_confidence": 0.56,
     "minimum_margin": 0.035,
     "high_confidence_override": 0.82,
-    "template_scale_min": 0.85,
-    "template_scale_max": 1.5,
-    "template_scale_steps": 7,
+    "pizza_override_confidence": 0.58,
+    "template_scale_min": 0.9,
+    "template_scale_max": 1.1,
+    "template_scale_steps": 3,
     "large_template_max_edge": 48
   },
   "paths": {

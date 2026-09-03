@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+import multiprocessing
 import os
 from pathlib import Path
 from typing import Optional, Tuple
@@ -284,3 +285,102 @@ class BlueStacksWindowCapture:
         if frame.size == 0 or float(frame.std()) < 1.0:
             raise RuntimeError("BlueStacks returned an empty/blank frame")
         return frame
+
+
+def _capture_worker_main(adb_port: int, window_title: str, connection) -> None:
+    """Own PrintWindow in a disposable process because the Win32 call can hang."""
+    capture = BlueStacksWindowCapture(adb_port=adb_port, window_title=window_title)
+    try:
+        while True:
+            command = connection.recv()
+            if command == "stop":
+                return
+            if command != "capture":
+                continue
+            try:
+                connection.send(("ok", capture.capture()))
+            except Exception as exc:  # The parent turns this into a retryable capture error.
+                connection.send(("error", repr(exc)))
+    except (EOFError, BrokenPipeError, OSError):
+        return
+    finally:
+        connection.close()
+
+
+class TimedBlueStacksWindowCapture:
+    """PrintWindow worker with a hard timeout and automatic process recovery."""
+
+    def __init__(
+        self,
+        adb_port: int,
+        window_title: str = "",
+        timeout_seconds: float = 5.0,
+    ):
+        self.adb_port = int(adb_port)
+        self.window_title = window_title
+        self.timeout_seconds = max(1.0, float(timeout_seconds))
+        self._context = multiprocessing.get_context("spawn")
+        self._connection = None
+        self._process = None
+
+    def _start(self) -> None:
+        parent_connection, child_connection = self._context.Pipe(duplex=True)
+        process = self._context.Process(
+            target=_capture_worker_main,
+            args=(self.adb_port, self.window_title, child_connection),
+            name=f"bluestacks-capture-{self.adb_port}",
+            daemon=True,
+        )
+        process.start()
+        child_connection.close()
+        self._connection = parent_connection
+        self._process = process
+
+    def _stop(self) -> None:
+        connection = self._connection
+        process = self._process
+        self._connection = None
+        self._process = None
+        if connection is not None:
+            try:
+                if process is not None and process.is_alive():
+                    connection.send("stop")
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            connection.close()
+        if process is not None:
+            process.join(timeout=0.5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
+
+    def _restart(self) -> None:
+        self._stop()
+        self._start()
+
+    def capture(self) -> np.ndarray:
+        if (
+            self._process is None
+            or self._connection is None
+            or not self._process.is_alive()
+        ):
+            self._restart()
+
+        try:
+            self._connection.send("capture")
+            if not self._connection.poll(self.timeout_seconds):
+                self._restart()
+                raise RuntimeError(
+                    f"BlueStacks PrintWindow timed out after {self.timeout_seconds:.1f}s; capture worker restarted"
+                )
+            status, payload = self._connection.recv()
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            self._restart()
+            raise RuntimeError(f"BlueStacks capture worker failed and restarted: {exc}") from exc
+
+        if status != "ok":
+            raise RuntimeError(f"BlueStacks capture failed: {payload}")
+        return payload
+
+    def close(self) -> None:
+        self._stop()

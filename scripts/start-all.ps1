@@ -7,6 +7,7 @@ $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $runtimeDir = Join-Path $projectRoot 'runtime'
 $logDir = Join-Path $runtimeDir 'logs'
 $statePath = Join-Path $runtimeDir 'processes.json'
+$stoppedStatePath = Join-Path $runtimeDir 'processes.stopped.json'
 $backendDir = Join-Path $projectRoot 'apps\backend\GreedyStats.Api'
 $frontendDir = Join-Path $projectRoot 'apps\frontend'
 $scannerDir = Join-Path $projectRoot 'services\scanner'
@@ -74,24 +75,33 @@ if (-not $backendMigrated) {
     throw "Backend không sẵn sàng để migrate database trước khi chạy scanner."
 }
 
-$scanner = Start-Process -FilePath 'python' `
-    -ArgumentList @('scanner.py') `
-    -WorkingDirectory $scannerDir `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput (Join-Path $logDir 'scanner.stdout.log') `
-    -RedirectStandardError (Join-Path $logDir 'scanner.stderr.log') `
-    -PassThru
-
 $state = [ordered]@{
     startedAt = (Get-Date).ToString('o')
     backendPid = $backend.Id
     frontendPid = $frontend.Id
-    scannerPid = $scanner.Id
+    scannerPid = $null
+    scannerTaskName = 'ToolAutoXalat-Scanner'
     backendUrl = 'http://127.0.0.1:5117'
     frontendUrl = 'http://127.0.0.1:5173'
     emulator = '127.0.0.1:5555'
 }
+$previousTunnel = if (Test-Path -LiteralPath $stoppedStatePath) {
+    Get-Content -LiteralPath $stoppedStatePath -Raw | ConvertFrom-Json
+}
+if ($previousTunnel.cloudflaredPid) {
+    $cloudflared = Get-Process -Id $previousTunnel.cloudflaredPid -ErrorAction SilentlyContinue
+    if ($cloudflared -and $cloudflared.ProcessName -eq 'cloudflared') {
+        $state['cloudflaredPid'] = [int]$previousTunnel.cloudflaredPid
+        $state['cloudflareUrl'] = $previousTunnel.cloudflareUrl
+        $state['cloudflareStartedAt'] = $previousTunnel.cloudflareStartedAt
+        $state['cloudflareLog'] = $previousTunnel.cloudflareLog
+    }
+}
 $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8
+
+& (Join-Path $PSScriptRoot 'restart-scanner.ps1')
+$scannerState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+$scannerPid = [int]$scannerState.scannerPid
 
 $deadline = (Get-Date).AddSeconds(30)
 $backendReady = $false
@@ -119,5 +129,5 @@ $scannerStatus = Invoke-RestMethod -Uri 'http://127.0.0.1:5117/api/scanner/statu
 
 Write-Host "Backend : http://127.0.0.1:5117 (PID $($backend.Id))"
 Write-Host "Frontend: http://127.0.0.1:5173 (PID $($frontend.Id))"
-Write-Host "Scanner : PID $($scanner.Id), status=$($scannerStatus.status), online=$($scannerStatus.isOnline)"
+Write-Host "Scanner : PID $scannerPid, status=$($scannerStatus.status), online=$($scannerStatus.isOnline)"
 Write-Host "Logs    : $logDir"

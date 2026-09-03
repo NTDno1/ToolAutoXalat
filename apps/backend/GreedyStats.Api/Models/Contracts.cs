@@ -47,6 +47,20 @@ public sealed record StreakBucketDto(
     int Count,
     IReadOnlyList<StreakRunDto> Runs);
 
+public sealed record StreakRunSummaryDto(
+    string Category,
+    int Length,
+    long StartResultId,
+    long EndResultId,
+    int? StartRound,
+    int? EndRound,
+    DateTimeOffset StartedAtUtc,
+    DateTimeOffset EndedAtUtc);
+
+public sealed record StreakBucketSummaryDto(
+    int Length,
+    int Count);
+
 public sealed record TodayStatsDto(
     string LocalDate,
     long TotalResults,
@@ -64,6 +78,25 @@ public sealed record TodayStatsDto(
     IReadOnlyList<StreakRunDto> MeatRuns,
     IReadOnlyList<StreakBucketDto> VegetableStreakBuckets,
     IReadOnlyList<StreakBucketDto> MeatStreakBuckets,
+    ResultDto? LatestResult);
+
+public sealed record CompactTodayStatsDto(
+    string LocalDate,
+    long TotalResults,
+    long RoundCount,
+    long MissedRoundCount,
+    long VegetableCount,
+    long MeatCount,
+    long SpecialCount,
+    int CurrentVegetableStreak,
+    int CurrentMeatStreak,
+    int LongestVegetableStreak,
+    int LongestMeatStreak,
+    IReadOnlyDictionary<string, long> ItemCounts,
+    IReadOnlyList<StreakRunSummaryDto> VegetableRuns,
+    IReadOnlyList<StreakRunSummaryDto> MeatRuns,
+    IReadOnlyList<StreakBucketSummaryDto> VegetableStreakBuckets,
+    IReadOnlyList<StreakBucketSummaryDto> MeatStreakBuckets,
     ResultDto? LatestResult);
 
 public sealed record DailySummaryDto(

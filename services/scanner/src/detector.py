@@ -109,6 +109,9 @@ class HistoryDetector:
         self.minimum_confidence = float(detection_config["minimum_confidence"])
         self.minimum_margin = float(detection_config["minimum_margin"])
         self.high_confidence_override = float(detection_config["high_confidence_override"])
+        self.pizza_override_confidence = float(
+            detection_config.get("pizza_override_confidence", 0.58)
+        )
         self.large_template_max_edge = int(
             detection_config.get("large_template_max_edge", 48)
         )
@@ -194,16 +197,18 @@ class HistoryDetector:
             code: self._best_template_score(slot, variants)
             for code, variants in self.templates.items()
         }
-        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-        best_code, confidence = ranked[0]
-        second_score = ranked[1][1]
+        best_code, confidence, second_score, special_override = self._rank_scores(scores)
         margin = confidence - second_score
         if confidence < self.minimum_confidence:
             raise DetectionError(
                 f"Slot {index + 1}: confidence {confidence:.3f} below "
                 f"{self.minimum_confidence:.3f}; best={best_code}"
             )
-        if margin < self.minimum_margin and confidence < self.high_confidence_override:
+        if (
+            not special_override
+            and margin < self.minimum_margin
+            and confidence < self.high_confidence_override
+        ):
             raise DetectionError(
                 f"Slot {index + 1}: ambiguous {best_code}; "
                 f"confidence={confidence:.3f}, margin={margin:.3f}"
@@ -220,6 +225,20 @@ class HistoryDetector:
             center_y=center_y,
             scores=scores,
         )
+
+    def _rank_scores(
+        self, scores: dict[str, float]
+    ) -> tuple[str, float, float, bool]:
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_code, confidence = ranked[0]
+        second_score = ranked[1][1]
+        pizza_score = scores.get("PIZZA", -1.0)
+        if pizza_score >= self.pizza_override_confidence:
+            strongest_non_pizza = max(
+                score for code, score in scores.items() if code != "PIZZA"
+            )
+            return "PIZZA", pizza_score, strongest_non_pizza, True
+        return best_code, confidence, second_score, False
 
     def detect(self, frame: np.ndarray) -> HistoryDetection:
         if frame is None or frame.ndim != 3:

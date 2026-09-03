@@ -6,6 +6,7 @@ using GreedyStats.Api.Models;
 using GreedyStats.Api.Services;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.ResponseCompression;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Configuration.AddJsonFile("appsettings.Admin.json", optional: true, reloadOnChange: true);
@@ -17,6 +18,12 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 });
 builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
     policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
+builder.Services.AddResponseCompression(options =>
+{
+    options.EnableForHttps = true;
+    options.Providers.Add<BrotliCompressionProvider>();
+    options.Providers.Add<GzipCompressionProvider>();
+});
 builder.Services.AddSingleton<GreedyDatabase>();
 builder.Services.AddSingleton<PredictionService>();
 builder.Services.AddSingleton<AdminAuthenticationService>();
@@ -47,11 +54,12 @@ builder.Services.AddHttpClient("alert-webhook", client =>
 });
 builder.Services.AddHttpClient("ai-prediction-provider", client =>
 {
-    client.Timeout = TimeSpan.FromSeconds(90);
+    client.Timeout = TimeSpan.FromSeconds(20);
 });
 builder.Services.AddHostedService<AlertMonitorService>();
 
 var app = builder.Build();
+app.UseResponseCompression();
 app.UseCors();
 app.UseAuthentication();
 app.UseAuthorization();
@@ -102,6 +110,7 @@ app.MapGet("/", () => Results.Ok(new
         "/api/results?page=1&pageSize=50&date=yyyy-MM-dd",
         "/api/stats/today",
         "/api/stats/daily?date=yyyy-MM-dd",
+        "/api/stats/streaks?date=yyyy-MM-dd&category=VEGETABLE&length=2",
         "/api/stats/days",
         "/api/predictions/next?date=yyyy-MM-dd",
         "/api/predictions/ai?date=yyyy-MM-dd",
@@ -219,6 +228,49 @@ app.MapGet("/api/stats/daily", async (
         return Results.BadRequest(new { error = "date phải có định dạng yyyy-MM-dd" });
     }
     return Results.Ok(await db.GetStatsForDateAsync(selectedDate, cancellationToken));
+});
+
+app.MapGet("/api/stats/daily/compact", async (
+    string? date,
+    GreedyDatabase db,
+    CancellationToken cancellationToken) =>
+{
+    if (!TryResolveDate(date, db, out var selectedDate))
+    {
+        return Results.BadRequest(new { error = "date phải có định dạng yyyy-MM-dd" });
+    }
+    return Results.Ok(await db.GetCompactStatsForDateAsync(selectedDate, cancellationToken));
+});
+
+app.MapGet("/api/stats/streaks", async (
+    string? date,
+    string? category,
+    int? length,
+    GreedyDatabase db,
+    CancellationToken cancellationToken) =>
+{
+    if (!TryResolveDate(date, db, out var selectedDate))
+    {
+        return Results.BadRequest(new { error = "date phải có định dạng yyyy-MM-dd" });
+    }
+
+    var normalizedCategory = category?.Trim().ToUpperInvariant();
+    if (normalizedCategory is not ("VEGETABLE" or "MEAT"))
+    {
+        return Results.BadRequest(new { error = "category phải là VEGETABLE hoặc MEAT" });
+    }
+    if (length is null or < 2)
+    {
+        return Results.BadRequest(new { error = "length phải >= 2" });
+    }
+
+    var stats = await db.GetStatsForDateAsync(selectedDate, cancellationToken);
+    var buckets = normalizedCategory == "VEGETABLE"
+        ? stats.VegetableStreakBuckets
+        : stats.MeatStreakBuckets;
+    var bucket = buckets.FirstOrDefault(item => item.Length == length.Value)
+        ?? new StreakBucketDto(length.Value, 0, []);
+    return Results.Ok(bucket);
 });
 
 app.MapGet("/api/stats/days", async (

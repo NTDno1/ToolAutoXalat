@@ -6,7 +6,7 @@ import unittest
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from detector import find_sequence_shift  # noqa: E402
+from detector import HistoryDetector, find_sequence_shift  # noqa: E402
 
 
 class SequenceShiftTests(unittest.TestCase):
@@ -28,6 +28,35 @@ class SequenceShiftTests(unittest.TestCase):
         previous = ["CAI", "BANH_MI", "NGO", "DUI", "CA_CHUA", "XIEN", "BO", "CA_ROT"]
         current = ["NGO", "NGO", "NGO", "NGO", "NGO", "NGO", "NGO", "CAI"]
         self.assertEqual(0, find_sequence_shift(previous, current))
+
+
+class PizzaOverrideTests(unittest.TestCase):
+    def setUp(self):
+        self.detector = HistoryDetector.__new__(HistoryDetector)
+        self.detector.pizza_override_confidence = 0.58
+
+    def test_real_pizza_signal_overrides_accidental_cabbage_match(self):
+        code, confidence, strongest_other, overridden = self.detector._rank_scores({
+            "CAI": 0.756,
+            "CA_CHUA": 0.639,
+            "PIZZA": 0.612,
+            "XIEN": 0.498,
+        })
+        self.assertEqual("PIZZA", code)
+        self.assertAlmostEqual(0.612, confidence)
+        self.assertAlmostEqual(0.756, strongest_other)
+        self.assertTrue(overridden)
+
+    def test_ordinary_item_below_pizza_threshold_is_unchanged(self):
+        code, confidence, _, overridden = self.detector._rank_scores({
+            "CAI": 0.938,
+            "CA_CHUA": 0.730,
+            "PIZZA": 0.474,
+            "XIEN": 0.561,
+        })
+        self.assertEqual("CAI", code)
+        self.assertAlmostEqual(0.938, confidence)
+        self.assertFalse(overridden)
 
 
 if __name__ == "__main__":
