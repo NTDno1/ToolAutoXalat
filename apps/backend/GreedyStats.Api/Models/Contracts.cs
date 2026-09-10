@@ -132,10 +132,12 @@ public sealed record ScannerStatusDto(
     bool IsOnline,
     DateTimeOffset? LastHeartbeatUtc,
     long? LastResultId,
+    string? LastResultRevision,
     IReadOnlyList<string> LastSequence,
     int OfflineAfterSeconds,
     string? SourceSerial,
     int? CurrentRound,
+    int? ActiveRound,
     int? CountdownSeconds,
     DateTimeOffset? CountdownObservedAtUtc,
     DateTimeOffset ServerUtc);

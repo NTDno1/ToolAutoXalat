@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -150,9 +150,14 @@ class ScannerDatabase:
             connection.executescript(INDEXES)
 
     def set_state(self, key: str, value: str) -> None:
+        self.set_states({key: value})
+
+    def set_states(self, values: dict[str, str]) -> None:
+        if not values:
+            return
         now = utc_text()
         with self.connect() as connection:
-            connection.execute(
+            connection.executemany(
                 """
                 INSERT INTO scanner_state(state_key, state_value, updated_at_utc)
                 VALUES (?, ?, ?)
@@ -160,7 +165,7 @@ class ScannerDatabase:
                     state_value=excluded.state_value,
                     updated_at_utc=excluded.updated_at_utc
                 """,
-                (key, value, now),
+                [(key, value, now) for key, value in values.items()],
             )
 
     def get_state(self, key: str) -> Optional[str]:
@@ -229,6 +234,185 @@ class ScannerDatabase:
             connection.execute(
                 "UPDATE results SET capture_path=? WHERE id=?", (capture_path, result_id)
             )
+
+    def reconcile_result(
+        self,
+        result_id: int,
+        item_code: str,
+        item_name: str,
+        category: str,
+        confidence: float,
+        sequence: list[str],
+        detection_reason: str,
+    ) -> None:
+        """Replace a provisional popup classification with verified history data."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE results SET
+                    item_code=?, item_name=?, category=?, confidence=?,
+                    sequence_json=?, detection_reason=?
+                WHERE id=?
+                """,
+                (
+                    item_code,
+                    item_name,
+                    category,
+                    confidence,
+                    json.dumps(sequence, ensure_ascii=False),
+                    detection_reason,
+                    result_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"Could not reconcile provisional result id={result_id}"
+                )
+
+    def synchronize_verified_sequence(
+        self,
+        source_serial: str,
+        round_local_date: str,
+        latest_round: int,
+        outcomes: list[tuple[str, str, str, float]],
+        sequence: list[str],
+        anchor_result_id: int,
+        round_interval_seconds: float,
+    ) -> list[dict[str, object]]:
+        """Backfill/correct the eight round rows from a verified app history strip."""
+        if latest_round <= 0 or not outcomes:
+            return []
+
+        actions: list[dict[str, object]] = []
+        now = utc_text()
+        serialized_sequence = json.dumps(sequence, ensure_ascii=False)
+        with self.connect() as connection:
+            anchor_row = connection.execute(
+                "SELECT detected_at_utc FROM results WHERE id=?",
+                (anchor_result_id,),
+            ).fetchone()
+            try:
+                anchor_detected_at = datetime.fromisoformat(
+                    str(anchor_row[0]).replace("Z", "+00:00")
+                ) if anchor_row else utc_now()
+            except ValueError:
+                anchor_detected_at = utc_now()
+            newer_detected_at: Optional[datetime] = None
+
+            for offset, (code, name, category, confidence) in enumerate(outcomes[:8]):
+                round_number = latest_round - offset
+                if round_number <= 0:
+                    break
+                existing = connection.execute(
+                    """
+                    SELECT id, item_code, detected_at_utc FROM results
+                    WHERE source_serial=? AND round_local_date=? AND round_number=?
+                    """,
+                    (source_serial, round_local_date, round_number),
+                ).fetchone()
+                if existing:
+                    result_id = int(existing[0])
+                    previous_code = str(existing[1])
+                    try:
+                        existing_detected_at = datetime.fromisoformat(
+                            str(existing[2]).replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        existing_detected_at = anchor_detected_at - timedelta(
+                            seconds=max(1.0, round_interval_seconds) * offset
+                        )
+                    retimed = (
+                        newer_detected_at is not None
+                        and existing_detected_at >= newer_detected_at
+                    )
+                    if retimed:
+                        existing_detected_at = newer_detected_at - timedelta(
+                            milliseconds=1
+                        )
+                    newer_detected_at = existing_detected_at
+                    if previous_code == code:
+                        if retimed:
+                            connection.execute(
+                                "UPDATE results SET detected_at_utc=? WHERE id=?",
+                                (utc_text(existing_detected_at), result_id),
+                            )
+                            actions.append(
+                                {
+                                    "action": "retimed",
+                                    "id": result_id,
+                                    "round": round_number,
+                                    "code": code,
+                                }
+                            )
+                        continue
+                    connection.execute(
+                        """
+                        UPDATE results SET
+                            item_code=?, item_name=?, category=?, confidence=?,
+                            sequence_json=?, detection_reason=?, detected_at_utc=?
+                        WHERE id=?
+                        """,
+                        (
+                            code,
+                            name,
+                            category,
+                            confidence,
+                            serialized_sequence,
+                            "history_corrected_verified_8",
+                            utc_text(existing_detected_at),
+                            result_id,
+                        ),
+                    )
+                    actions.append(
+                        {
+                            "action": "corrected",
+                            "id": result_id,
+                            "round": round_number,
+                            "previousCode": previous_code,
+                            "code": code,
+                        }
+                    )
+                    continue
+
+                estimated_at = anchor_detected_at - timedelta(
+                    seconds=max(1.0, round_interval_seconds) * offset
+                )
+                if newer_detected_at is not None and estimated_at >= newer_detected_at:
+                    estimated_at = newer_detected_at - timedelta(milliseconds=1)
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO results(
+                        round_number, round_local_date, source_serial,
+                        item_code, item_name, category, detected_at_utc, confidence,
+                        sequence_json, detection_reason, capture_path, created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                    """,
+                    (
+                        round_number,
+                        round_local_date,
+                        source_serial,
+                        code,
+                        name,
+                        category,
+                        utc_text(estimated_at),
+                        confidence,
+                        serialized_sequence,
+                        "history_backfilled_verified_8",
+                        now,
+                    ),
+                )
+                if cursor.rowcount > 0:
+                    newer_detected_at = estimated_at
+                    actions.append(
+                        {
+                            "action": "inserted",
+                            "id": int(cursor.lastrowid),
+                            "round": round_number,
+                            "code": code,
+                        }
+                    )
+
+        return actions
 
     def insert_event(
         self,

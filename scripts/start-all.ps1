@@ -11,6 +11,8 @@ $stoppedStatePath = Join-Path $runtimeDir 'processes.stopped.json'
 $backendDir = Join-Path $projectRoot 'apps\backend\GreedyStats.Api'
 $frontendDir = Join-Path $projectRoot 'apps\frontend'
 $scannerDir = Join-Path $projectRoot 'services\scanner'
+$scannerConfig = Get-Content -LiteralPath (Join-Path $scannerDir 'config.json') -Raw | ConvertFrom-Json
+$emulatorSerial = '{0}:{1}' -f $scannerConfig.emulator.adb_host, $scannerConfig.emulator.adb_port
 
 New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir | Out-Null
 
@@ -83,7 +85,7 @@ $state = [ordered]@{
     scannerTaskName = 'ToolAutoXalat-Scanner'
     backendUrl = 'http://127.0.0.1:5117'
     frontendUrl = 'http://127.0.0.1:5173'
-    emulator = '127.0.0.1:5555'
+    emulator = $emulatorSerial
 }
 $previousTunnel = if (Test-Path -LiteralPath $stoppedStatePath) {
     Get-Content -LiteralPath $stoppedStatePath -Raw | ConvertFrom-Json

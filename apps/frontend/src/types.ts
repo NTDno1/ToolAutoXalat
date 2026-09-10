@@ -87,10 +87,12 @@ export interface ScannerStatus {
   isOnline: boolean
   lastHeartbeatUtc: string | null
   lastResultId: number | null
+  lastResultRevision: string | null
   lastSequence: string[]
   offlineAfterSeconds: number
   sourceSerial: string | null
   currentRound: number | null
+  activeRound: number | null
   countdownSeconds: number | null
   countdownObservedAtUtc: string | null
   serverUtc: string

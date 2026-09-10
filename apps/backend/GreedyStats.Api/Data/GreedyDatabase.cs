@@ -477,6 +477,22 @@ public sealed class GreedyDatabase
         {
             currentRound = parsedRound;
         }
+        int? activeRound = null;
+        DateTimeOffset? activeRoundObservedAt = null;
+        if (state.TryGetValue("scanner_active_round", out var activeRoundRaw) &&
+            int.TryParse(activeRoundRaw, out var parsedActiveRound))
+        {
+            activeRound = parsedActiveRound;
+        }
+        if (state.TryGetValue("scanner_active_round_observed_at_utc", out var activeRoundObservedRaw))
+        {
+            activeRoundObservedAt = ParseUtc(activeRoundObservedRaw);
+        }
+        if (!activeRoundObservedAt.HasValue ||
+            (DateTimeOffset.UtcNow - activeRoundObservedAt.Value).TotalSeconds > 50)
+        {
+            activeRound = null;
+        }
         IReadOnlyList<string> sequence = Array.Empty<string>();
         if (state.TryGetValue("last_sequence", out var sequenceRaw))
         {
@@ -521,10 +537,12 @@ public sealed class GreedyDatabase
             online,
             heartbeat,
             lastResultId,
+            state.GetValueOrDefault("last_result_revision"),
             sequence,
             _offlineAfterSeconds,
             state.GetValueOrDefault("scanner_source_serial"),
             currentRound,
+            activeRound,
             countdownSeconds,
             countdownObservedAt,
             DateTimeOffset.UtcNow);
@@ -568,6 +586,11 @@ public sealed class GreedyDatabase
         var stats = await GetTodayStatsAsync(cancellationToken);
         var latest = stats.LatestResult;
         if (latest is null)
+        {
+            return null;
+        }
+        if (latest.DetectionReason.StartsWith(
+                "result_popup_pending", StringComparison.Ordinal))
         {
             return null;
         }

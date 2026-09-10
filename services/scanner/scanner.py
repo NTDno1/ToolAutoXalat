@@ -37,10 +37,12 @@ from detector import (  # noqa: E402
     HistoryDetection,
     HistoryDetector,
     ITEMS,
+    PopupResultDetection,
     find_sequence_shift,
 )
 from popup_detector import is_result_popup  # noqa: E402
-from round_detector import RoundDetectionError, RoundDetector  # noqa: E402
+from round_detector import RoundDetection, RoundDetectionError, RoundDetector  # noqa: E402
+from verification import StableSequenceVerifier  # noqa: E402
 
 
 class BlueStacksFrameSource:
@@ -132,6 +134,18 @@ class GreedyScanner:
             self.config["detection"],
         )
         self.round_detector = RoundDetector(self.config["round"])
+        self.round_scan_interval = max(
+            1.0, float(self.config["round"].get("scan_interval_seconds", 2.0))
+        )
+        self.round_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="round-ocr"
+        )
+        self.round_future: Optional[Future[RoundDetection]] = None
+        self.round_future_observed_at: Optional[datetime] = None
+        self.last_round_submit_monotonic = 0.0
+        self.active_round: Optional[int] = None
+        self.active_round_observed_at: Optional[datetime] = None
+        self.active_round_date: Optional[str] = None
         self.countdown_detector = CountdownDetector(self.config["countdown"])
         self.countdown_scan_interval = max(
             0.5, float(self.config["countdown"].get("scan_interval_seconds", 0.75))
@@ -187,7 +201,28 @@ class GreedyScanner:
         self.popup_result_grace = max(
             0.0, float(popup.get("result_grace_seconds", 12))
         )
+        self.popup_result_confirmations = max(
+            1, int(popup.get("result_confirmations", 2))
+        )
+        self.popup_result_candidate_timeout = max(
+            0.5, float(popup.get("result_candidate_timeout_seconds", 2))
+        )
+        self.history_verifier = StableSequenceVerifier(
+            required_confirmations=int(popup.get("history_confirmations", 3)),
+            timeout_seconds=float(
+                popup.get("history_confirmation_timeout_seconds", 2)
+            ),
+        )
         self.last_popup_dismiss_monotonic = 0.0
+        self.last_popup_seen_monotonic = 0.0
+        self.popup_candidate_code: Optional[str] = None
+        self.popup_candidate_count = 0
+        self.popup_candidate_seen_monotonic = 0.0
+        self.pending_popup_result_code: Optional[str] = None
+        self.pending_popup_result_id: Optional[int] = None
+        self.pending_popup_round_number: Optional[int] = None
+        self.pending_popup_round_local_date: Optional[str] = None
+        self.pending_popup_result_monotonic = 0.0
 
         backend = self.config["backend"]
         self.backend_url = backend["base_url"].rstrip("/")
@@ -257,9 +292,112 @@ class GreedyScanner:
             self.countdown_detector.detect, frame.copy()
         )
 
-    def _dismiss_result_popup(self, frame: np.ndarray) -> bool:
-        if not self.popup_dismiss_enabled or not is_result_popup(
-            frame, self.popup_dismiss_config
+    def _publish_active_round(self, number: int, observed_at: datetime) -> bool:
+        local_date = self._local_date()
+        if (
+            self.active_round is not None
+            and self.active_round_date == local_date
+            and number < self.active_round
+        ):
+            return False
+        if (
+            self.active_round is not None
+            and self.active_round_observed_at is not None
+            and self.active_round_date == local_date
+        ):
+            elapsed = max(
+                0.0, (observed_at - self.active_round_observed_at).total_seconds()
+            )
+            maximum_step = max(2, int(elapsed / max(1.0, self.round_interval)) + 2)
+            if number - self.active_round > maximum_step:
+                return False
+
+        changed = number != self.active_round or local_date != self.active_round_date
+        self.active_round = number
+        self.active_round_observed_at = observed_at
+        self.active_round_date = local_date
+        observed_utc = observed_at.isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+        states = {
+            "scanner_active_round": str(number),
+            "scanner_active_round_observed_at_utc": observed_utc,
+        }
+        if (
+            self.popup_candidate_code is None
+            and self.pending_popup_result_code is None
+            and (
+                self.current_round_date != local_date
+                or self.current_round is None
+                or number > self.current_round
+            )
+        ):
+            # Outside a result popup the app label is the latest completed
+            # round. Re-anchor inference here so missed detections cannot
+            # leave every later result permanently offset.
+            self.current_round = number
+            self.current_round_date = local_date
+            states["scanner_current_round"] = str(number)
+            states[self._state_key("current_round")] = str(number)
+            states[self._state_key("round_local_date")] = local_date
+        self.database.set_states(states)
+        if changed:
+            self.logger.info("ACTIVE ROUND OCR=%s", number)
+        return True
+
+    def _collect_round_detection(self) -> None:
+        future = self.round_future
+        if future is None or not future.done():
+            return
+        observed_at = self.round_future_observed_at or utc_now()
+        self.round_future = None
+        self.round_future_observed_at = None
+        try:
+            detection = future.result()
+        except (RoundDetectionError, OSError, RuntimeError):
+            return
+        self._publish_active_round(detection.number, observed_at)
+
+    def _schedule_round_detection(self, frame: np.ndarray) -> None:
+        self._collect_round_detection()
+        if self.round_future is not None:
+            return
+        now = time.monotonic()
+        if now - self.last_round_submit_monotonic < self.round_scan_interval:
+            return
+        self.last_round_submit_monotonic = now
+        self.round_future_observed_at = utc_now()
+        self.round_future = self.round_executor.submit(
+            self.round_detector.detect, frame.copy()
+        )
+
+    def _round_for_popup_result(
+        self, frame: np.ndarray, local_date: str
+    ) -> Optional[int]:
+        self._collect_round_detection()
+        if (
+            self.active_round is not None
+            and self.active_round_date == local_date
+            and self.active_round_observed_at is not None
+            and (utc_now() - self.active_round_observed_at).total_seconds()
+            <= self.round_interval + 5
+        ):
+            return self.active_round
+
+        observed_round = self._read_round(frame)
+        if observed_round is not None:
+            self._publish_active_round(observed_round, utc_now())
+            return observed_round
+        if self.current_round is not None and self.current_round_date == local_date:
+            return self.current_round + 1
+        return None
+
+    def _dismiss_result_popup(
+        self, frame: np.ndarray, assume_visible: bool = False
+    ) -> bool:
+        if not self.popup_dismiss_enabled or (
+            not assume_visible
+            and not is_result_popup(frame, self.popup_dismiss_config)
         ):
             return False
 
@@ -302,6 +440,147 @@ class GreedyScanner:
         )
         return True
 
+    def _clear_popup_candidate(self) -> None:
+        self.popup_candidate_code = None
+        self.popup_candidate_count = 0
+        self.popup_candidate_seen_monotonic = 0.0
+
+    def _clear_pending_popup_result(self) -> None:
+        self.pending_popup_result_code = None
+        self.pending_popup_result_id = None
+        self.pending_popup_round_number = None
+        self.pending_popup_round_local_date = None
+        self.pending_popup_result_monotonic = 0.0
+        self.history_verifier.reset()
+
+    def _touch_result_revision(self) -> None:
+        revision = utc_now().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        self.database.set_state("last_result_revision", revision)
+
+    def _handle_result_popup(self, frame: np.ndarray) -> dict:
+        now = time.monotonic()
+        self.last_popup_seen_monotonic = now
+
+        try:
+            detection = self.detector.detect_popup_result(
+                frame, self.popup_dismiss_config
+            )
+        except DetectionError as exc:
+            if (
+                self.popup_candidate_seen_monotonic > 0
+                and now - self.popup_candidate_seen_monotonic
+                > self.popup_result_candidate_timeout
+            ):
+                self._clear_popup_candidate()
+            self._save_runtime_state("RESULT_POPUP")
+            return {"status": "popup_waiting", "error": str(exc)}
+
+        pending_age = now - self.pending_popup_result_monotonic
+        if self.pending_popup_result_code is not None and pending_age < max(
+            self.popup_result_grace, self.post_popup_fast_window + 2.0
+        ):
+            dismissed = self._dismiss_result_popup(frame, assume_visible=True)
+            self._save_runtime_state("VERIFYING_RESULT")
+            return {
+                "status": (
+                    "popup_already_recorded"
+                    if self.pending_popup_result_code == detection.code
+                    else "popup_conflicting_candidate"
+                ),
+                "code": detection.code,
+                "resultId": self.pending_popup_result_id,
+                "dismissed": dismissed,
+            }
+        if self.pending_popup_result_code is not None:
+            self._clear_pending_popup_result()
+
+        # During some game transitions the persistent history strip becomes
+        # readable a few seconds before the popup animation settles. If that
+        # shift already committed this same item, the popup is confirmation of
+        # the existing round rather than a second result.
+        recent_result_age = (utc_now() - self.last_result_at).total_seconds()
+        if (
+            self.previous_sequence
+            and self.previous_sequence[0] == detection.code
+            and 0 <= recent_result_age <= self.popup_result_grace
+        ):
+            self._clear_popup_candidate()
+            dismissed = self._dismiss_result_popup(frame, assume_visible=True)
+            self._save_runtime_state("RUNNING", self.previous_sequence)
+            self.logger.info(
+                "RESULT POPUP MATCHED RECENT HISTORY item=%s age=%.1fs",
+                detection.code,
+                recent_result_age,
+            )
+            return {
+                "status": "popup_history_confirmed",
+                "code": detection.code,
+                "dismissed": dismissed,
+            }
+
+        same_candidate = (
+            self.popup_candidate_code == detection.code
+            and now - self.popup_candidate_seen_monotonic
+            <= self.popup_result_candidate_timeout
+        )
+        if same_candidate:
+            self.popup_candidate_count += 1
+        else:
+            self.popup_candidate_code = detection.code
+            self.popup_candidate_count = 1
+        self.popup_candidate_seen_monotonic = now
+
+        if self.popup_candidate_count < self.popup_result_confirmations:
+            self._save_runtime_state("RESULT_CANDIDATE")
+            return {
+                "status": "popup_candidate",
+                "code": detection.code,
+                "confidence": detection.confidence,
+                "confirmations": self.popup_candidate_count,
+            }
+
+        if self.previous_sequence is None:
+            # A first-ever startup has no eight-item baseline from which to
+            # build the immediate sequence. Let the persistent row establish
+            # that baseline after the popup closes.
+            self._save_runtime_state("RESULT_POPUP")
+            return {
+                "status": "popup_waiting_for_baseline",
+                "code": detection.code,
+            }
+
+        local_date = self._local_date()
+        round_number = self._round_for_popup_result(frame, local_date)
+
+        result_id, predicted_sequence = self._record_popup_result(
+            detection,
+            frame,
+            round_number,
+            local_date,
+        )
+        self.pending_popup_result_code = detection.code
+        self.pending_popup_result_id = result_id
+        self.pending_popup_round_number = round_number
+        self.pending_popup_round_local_date = local_date
+        self.pending_popup_result_monotonic = now
+        self.history_verifier.reset()
+        self.first_successful_scan = False
+        self._clear_popup_candidate()
+
+        # Publish the predicted one-position shift immediately. The persistent
+        # history row is reconciled a few seconds later when the popup closes.
+        self._save_runtime_state("RUNNING", predicted_sequence)
+        dismissed = self._dismiss_result_popup(frame, assume_visible=True)
+        return {
+            "status": "recorded",
+            "recordedIds": [result_id],
+            "code": detection.code,
+            "confidence": detection.confidence,
+            "sequence": predicted_sequence,
+            "dismissed": dismissed,
+            "source": "result_popup",
+        }
+
     def _resolve(self, value: str) -> Path:
         path = Path(value)
         return path.resolve() if path.is_absolute() else (self.config_dir / path).resolve()
@@ -314,9 +593,13 @@ class GreedyScanner:
             "%(asctime)s | %(levelname)-8s | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-        console = logging.StreamHandler(sys.stdout)
-        console.setFormatter(formatter)
-        logger.addHandler(console)
+        # Scheduled Task launches can expose a stdout handle with no active
+        # reader. Writing enough log output to that handle eventually blocks
+        # the scanner loop, so only mirror logs to an interactive terminal.
+        if sys.stdout is not None and sys.stdout.isatty():
+            console = logging.StreamHandler(sys.stdout)
+            console.setFormatter(formatter)
+            logger.addHandler(console)
         file_handler = logging.FileHandler(
             self.log_dir / "scanner.log", encoding="utf-8"
         )
@@ -361,31 +644,35 @@ class GreedyScanner:
 
     def _save_runtime_state(self, status: str, sequence: Optional[list[str]] = None) -> None:
         now = utc_now().isoformat(timespec="milliseconds").replace("+00:00", "Z")
-        self.database.set_state("scanner_status", status)
-        self.database.set_state("scanner_heartbeat_utc", now)
-        self.database.set_state("scanner_source_serial", self.frame_source.serial)
+        values = {
+            "scanner_status": status,
+            "scanner_heartbeat_utc": now,
+            "scanner_source_serial": self.frame_source.serial,
+            "last_result_at_utc": self.last_result_at.isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z"),
+            self._state_key("last_result_at_utc"): self.last_result_at.isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z"),
+        }
         if sequence is not None:
-            self.database.set_state("last_sequence", json.dumps(sequence))
-            self.database.set_state(
-                self._state_key("last_sequence"), json.dumps(sequence)
-            )
-        self.database.set_state(
-            "last_result_at_utc",
-            self.last_result_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        )
-        self.database.set_state(
-            self._state_key("last_result_at_utc"),
-            self.last_result_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        )
+            serialized_sequence = json.dumps(sequence)
+            values["last_sequence"] = serialized_sequence
+            values[self._state_key("last_sequence")] = serialized_sequence
         if self.current_round is not None:
-            self.database.set_state("scanner_current_round", str(self.current_round))
-            self.database.set_state(
-                self._state_key("current_round"), str(self.current_round)
+            values["scanner_current_round"] = str(self.current_round)
+            values[self._state_key("current_round")] = str(self.current_round)
+        if self.active_round is not None:
+            values["scanner_active_round"] = str(self.active_round)
+        if self.active_round_observed_at is not None:
+            values["scanner_active_round_observed_at_utc"] = (
+                self.active_round_observed_at.isoformat(timespec="milliseconds").replace(
+                    "+00:00", "Z"
+                )
             )
         if self.current_round_date:
-            self.database.set_state(
-                self._state_key("round_local_date"), self.current_round_date
-            )
+            values[self._state_key("round_local_date")] = self.current_round_date
+        self.database.set_states(values)
 
     def _read_round(self, frame: np.ndarray) -> Optional[int]:
         try:
@@ -418,6 +705,18 @@ class GreedyScanner:
         observed_round: Optional[int] = None,
     ) -> list[Optional[int]]:
         end_round = observed_round
+        if (
+            end_round is None
+            and self.active_round is not None
+            and self.active_round_date == local_date
+            and self.active_round_observed_at is not None
+            and (utc_now() - self.active_round_observed_at).total_seconds()
+            <= self.round_interval + 5
+        ):
+            # The app label names the round whose result is currently being
+            # revealed. Prefer that OCR value over inferred +1 arithmetic so
+            # a previously missed detection cannot keep all later rounds off.
+            end_round = self.active_round
         if end_round is None and self.current_round_date == local_date:
             end_round = (
                 self.current_round + shift if self.current_round is not None else None
@@ -497,35 +796,41 @@ class GreedyScanner:
         )
         self.logger.error("%s | %s", event_code, message)
 
-    def _save_result_crop(self, frame: np.ndarray, result_id: int) -> Optional[str]:
+    def _save_result_crop(
+        self,
+        frame: np.ndarray,
+        result_id: int,
+        crop: Optional[np.ndarray] = None,
+    ) -> Optional[str]:
         if not self.save_result_crops:
             return None
         day_dir = self.capture_dir / utc_now().strftime("%Y-%m-%d")
         day_dir.mkdir(parents=True, exist_ok=True)
         path = day_dir / f"result_{result_id:08d}.png"
-        cv2.imwrite(str(path), self.detector.crop_history(frame))
+        evidence = crop if crop is not None else self.detector.crop_history(frame)
+        cv2.imwrite(str(path), evidence)
         self.database.update_result_capture(result_id, str(path))
         return str(path)
 
-    def _record_result(
+    def _persist_result(
         self,
         code: str,
-        detection: HistoryDetection,
+        confidence: float,
+        sequence: list[str],
         frame: np.ndarray,
         reason: str,
-        round_number: Optional[int] = None,
-        round_local_date: Optional[str] = None,
+        round_number: Optional[int],
+        round_local_date: str,
+        evidence_crop: Optional[np.ndarray] = None,
     ) -> int:
-        round_local_date = round_local_date or self._local_date()
-        slot = next((value for value in detection.slots if value.code == code), detection.slots[0])
         item = ITEMS[code]
         detected_at = utc_now()
         result_id = self.database.insert_result(
             item_code=code,
             item_name=item["name"],
             category=item["category"],
-            confidence=slot.confidence,
-            sequence=detection.sequence,
+            confidence=confidence,
+            sequence=sequence,
             detection_reason=reason,
             source_serial=self.frame_source.serial,
             round_number=round_number,
@@ -539,20 +844,148 @@ class GreedyScanner:
         # Publish the committed row immediately. Saving the optional evidence
         # crop is not required by the dashboard and must not hold back its
         # realtime change signal.
-        self.database.set_state(
-            "last_result_id", str(result_id)
+        revision = utc_now().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        serialized_sequence = json.dumps(sequence)
+        self.database.set_states(
+            {
+                "last_result_id": str(result_id),
+                "last_result_revision": revision,
+                "last_sequence": serialized_sequence,
+                self._state_key("last_sequence"): serialized_sequence,
+            }
         )
-        self._save_result_crop(frame, result_id)
+        self._save_result_crop(frame, result_id, evidence_crop)
         self.logger.info(
             "NEW RESULT id=%s round=%s item=%s category=%s confidence=%.3f reason=%s",
             result_id,
             round_number,
             item["name"],
             item["category"],
-            slot.confidence,
+            confidence,
             reason,
         )
         return result_id
+
+    def _record_result(
+        self,
+        code: str,
+        detection: HistoryDetection,
+        frame: np.ndarray,
+        reason: str,
+        round_number: Optional[int] = None,
+        round_local_date: Optional[str] = None,
+    ) -> int:
+        round_local_date = round_local_date or self._local_date()
+        slot = next((value for value in detection.slots if value.code == code), detection.slots[0])
+        return self._persist_result(
+            code=code,
+            confidence=slot.confidence,
+            sequence=detection.sequence,
+            frame=frame,
+            reason=reason,
+            round_number=round_number,
+            round_local_date=round_local_date,
+        )
+
+    def _record_popup_result(
+        self,
+        detection: PopupResultDetection,
+        frame: np.ndarray,
+        round_number: Optional[int],
+        round_local_date: str,
+    ) -> tuple[int, list[str]]:
+        previous = self.previous_sequence or []
+        predicted_sequence = [detection.code, *previous[:7]]
+        result_id = self._persist_result(
+            code=detection.code,
+            confidence=detection.confidence,
+            sequence=predicted_sequence,
+            frame=frame,
+            reason="result_popup_pending_history",
+            round_number=round_number,
+            round_local_date=round_local_date,
+            evidence_crop=detection.crop,
+        )
+        return result_id, predicted_sequence
+
+    def _reconcile_popup_result(
+        self,
+        detection: HistoryDetection,
+        frame: np.ndarray,
+    ) -> tuple[bool, str, str]:
+        if self.pending_popup_result_id is None or self.pending_popup_result_code is None:
+            raise RuntimeError("No provisional popup result is waiting for verification")
+
+        popup_code = self.pending_popup_result_code
+        actual_slot = detection.slots[0]
+        actual_code = actual_slot.code
+        corrected = actual_code != popup_code
+        reason = (
+            "result_popup_corrected_by_history"
+            if corrected
+            else "result_popup_verified_history"
+        )
+        item = ITEMS[actual_code]
+        self.database.reconcile_result(
+            result_id=self.pending_popup_result_id,
+            item_code=actual_code,
+            item_name=item["name"],
+            category=item["category"],
+            confidence=actual_slot.confidence,
+            sequence=detection.sequence,
+            detection_reason=reason,
+        )
+        synchronized = []
+        if (
+            self.pending_popup_round_number is not None
+            and self.pending_popup_round_local_date is not None
+        ):
+            outcomes = []
+            for slot in detection.slots[:8]:
+                slot_item = ITEMS[slot.code]
+                outcomes.append(
+                    (
+                        slot.code,
+                        slot_item["name"],
+                        slot_item["category"],
+                        slot.confidence,
+                    )
+                )
+            synchronized = self.database.synchronize_verified_sequence(
+                source_serial=self.frame_source.serial,
+                round_local_date=self.pending_popup_round_local_date,
+                latest_round=self.pending_popup_round_number,
+                outcomes=outcomes,
+                sequence=detection.sequence,
+                anchor_result_id=self.pending_popup_result_id,
+                round_interval_seconds=self.round_interval,
+            )
+        self.database.set_state("last_result_id", str(self.pending_popup_result_id))
+        self._touch_result_revision()
+
+        if synchronized:
+            inserted = sum(entry["action"] == "inserted" for entry in synchronized)
+            repaired = sum(entry["action"] == "corrected" for entry in synchronized)
+            retimed = sum(entry["action"] == "retimed" for entry in synchronized)
+            self.logger.info(
+                "VERIFIED HISTORY SYNC latest_round=%s inserted=%s corrected=%s "
+                "retimed=%s rounds=%s",
+                self.pending_popup_round_number,
+                inserted,
+                repaired,
+                retimed,
+                [entry["round"] for entry in synchronized],
+            )
+
+        if self.save_result_crops:
+            day_dir = self.capture_dir / utc_now().strftime("%Y-%m-%d")
+            day_dir.mkdir(parents=True, exist_ok=True)
+            verification_path = (
+                day_dir / f"verification_{self.pending_popup_result_id:08d}.png"
+            )
+            cv2.imwrite(str(verification_path), self.detector.crop_history(frame))
+
+        return corrected, popup_code, actual_code
 
     def _scan_once_legacy(self) -> dict:
         frame: Optional[np.ndarray] = None
@@ -673,7 +1106,12 @@ class GreedyScanner:
                 elif (
                     self.no_result_attempts >= self.max_failed_attempts
                     and elapsed >= self.round_interval + self.max_failed_attempts * self.scan_interval
-                    and time.monotonic() - self.last_popup_dismiss_monotonic >= self.popup_result_grace
+                    and time.monotonic()
+                    - max(
+                        self.last_popup_seen_monotonic,
+                        self.last_popup_dismiss_monotonic,
+                    )
+                    >= self.popup_result_grace
                 ):
                     self._notify_failure(
                         "RESULT_TIMEOUT",
@@ -704,7 +1142,13 @@ class GreedyScanner:
             self.last_result_at = utc_now()
             self.no_result_attempts = 0
 
-        self._save_runtime_state("RUNNING", self.previous_sequence)
+        published_sequence = self.previous_sequence
+        if self.pending_popup_result_code is not None:
+            published_sequence = [
+                self.pending_popup_result_code,
+                *(self.previous_sequence or [])[:7],
+            ]
+        self._save_runtime_state("RUNNING", published_sequence)
         return {
             "status": "recorded" if recorded else "waiting",
             "recordedIds": recorded,
@@ -715,28 +1159,31 @@ class GreedyScanner:
 
     def scan_once(self) -> dict:
         self._collect_countdown_detection()
+        self._collect_round_detection()
         frame: Optional[np.ndarray] = None
         try:
             frame = self.frame_source.capture()
             # OCR runs on its own worker so reading the on-screen 30-second
             # timer never delays history matching or result persistence.
             self._schedule_countdown_detection(frame)
-            # The popup hides the complete history strip. Dismiss it before
-            # template matching and temporarily enter the fast scan cadence so
-            # the first fully visible eight-slot frame is persisted at once.
-            if self._dismiss_result_popup(frame):
+            self._schedule_round_detection(frame)
+            # The popup exposes the winning icon about five seconds before the
+            # persistent history strip shifts. Detect and publish it directly.
+            if is_result_popup(frame, self.popup_dismiss_config):
                 self.capture_failures = 0
                 self.no_result_attempts = 0
-                self._save_runtime_state("POPUP_DISMISSED")
-                return {"status": "popup_dismissed"}
+                return self._handle_result_popup(frame)
             detection = self.detector.detect(frame)
             self.capture_failures = 0
         except (RuntimeError, DetectionError, OSError) as exc:
-            if frame is not None and self._dismiss_result_popup(frame):
+            if frame is not None and is_result_popup(
+                frame, self.popup_dismiss_config
+            ):
                 self.capture_failures = 0
                 self.no_result_attempts = 0
-                self._save_runtime_state("POPUP_DISMISSED")
-                return {"status": "popup_dismissed"}
+                return self._handle_result_popup(frame)
+            if self.pending_popup_result_code is not None:
+                self.history_verifier.reset()
             self.capture_failures += 1
             self._save_runtime_state("DETECTION_RETRY")
             self.logger.warning(
@@ -851,11 +1298,106 @@ class GreedyScanner:
         if self.current_round_date != local_date:
             observed_round = self._read_round(frame)
 
+        history_is_stable = False
+        if self.pending_popup_result_code is not None:
+            history_is_stable = self.history_verifier.observe(sequence)
+
+        if (
+            self.pending_popup_result_code is not None
+            and not shift
+            and sequence != self.previous_sequence
+        ):
+            self._save_runtime_state(
+                "VERIFICATION_CONFLICT" if history_is_stable else "VERIFYING_RESULT",
+                [self.pending_popup_result_code, *(self.previous_sequence or [])[:7]],
+            )
+            if history_is_stable:
+                self._notify_failure(
+                    "RESULT_VERIFICATION_CONFLICT",
+                    "Stable history could not be aligned with the pre-result eight-slot baseline",
+                    {
+                        "resultId": self.pending_popup_result_id,
+                        "popupCode": self.pending_popup_result_code,
+                        "previous": self.previous_sequence,
+                        "observed": sequence,
+                        "historyConfirmations": self.history_verifier.confirmations,
+                    },
+                    self.detector.annotate(frame, detection),
+                )
+            return {
+                "status": "verification_conflict",
+                "confirmations": self.history_verifier.confirmations,
+                "sequence": sequence,
+            }
+
         if shift:
-            if self.current_round is None and observed_round is None:
+            new_codes = list(reversed(sequence[:shift]))
+            if self.pending_popup_result_code is not None:
+                if not history_is_stable:
+                    published_sequence = [
+                        self.pending_popup_result_code,
+                        *(self.previous_sequence or [])[:7],
+                    ]
+                    self._save_runtime_state("VERIFYING_RESULT", published_sequence)
+                    return {
+                        "status": "verifying_popup_result",
+                        "confirmations": self.history_verifier.confirmations,
+                        "requiredConfirmations": (
+                            self.history_verifier.required_confirmations
+                        ),
+                        "sequence": sequence,
+                    }
+
+                pending_id = self.pending_popup_result_id
+                corrected, popup_code, actual_code = self._reconcile_popup_result(
+                    detection, frame
+                )
+                self.previous_sequence = sequence
+                self.no_result_attempts = 0
+                self._clear_pending_popup_result()
+                self._save_runtime_state("RUNNING", sequence)
+
+                if corrected:
+                    self._notify_failure(
+                        "POPUP_RESULT_MISMATCH",
+                        "Popup result was corrected after three stable history scans",
+                        {
+                            "resultId": pending_id,
+                            "popupCode": popup_code,
+                            "correctedCode": actual_code,
+                            "shift": shift,
+                            "historyConfirmations": (
+                                self.history_verifier.required_confirmations
+                            ),
+                        },
+                        self.detector.annotate(frame, detection),
+                    )
+                self.logger.info(
+                    "POPUP RESULT %s id=%s popup=%s history=%s "
+                    "history_shift=%s confirmations=%s",
+                    "CORRECTED" if corrected else "VERIFIED",
+                    pending_id,
+                    popup_code,
+                    actual_code,
+                    shift,
+                    self.history_verifier.required_confirmations,
+                )
+                return {
+                    "status": (
+                        "popup_corrected" if corrected else "popup_verified"
+                    ),
+                    "resultId": pending_id,
+                    "popupCode": popup_code,
+                    "actualCode": actual_code,
+                    "sequence": sequence,
+                }
+
+            if new_codes and self.current_round is None and observed_round is None:
                 observed_round = self._read_round(frame)
-            round_numbers = self._rounds_for_shift(shift, local_date, observed_round)
-            for code, round_number in zip(reversed(sequence[:shift]), round_numbers):
+            round_numbers = self._rounds_for_shift(
+                len(new_codes), local_date, observed_round
+            )
+            for code, round_number in zip(new_codes, round_numbers):
                 recorded.append(
                     self._record_result(
                         code,
@@ -872,6 +1414,40 @@ class GreedyScanner:
             if observed_round is not None:
                 self.current_round = observed_round
                 self.current_round_date = local_date
+            if (
+                self.pending_popup_result_code is not None
+                and time.monotonic() - self.pending_popup_result_monotonic
+                >= self.popup_result_grace
+            ):
+                if (
+                    history_is_stable
+                    and len(set(sequence)) == 1
+                    and sequence[0] == self.pending_popup_result_code
+                ):
+                    pending_id = self.pending_popup_result_id
+                    _, popup_code, actual_code = self._reconcile_popup_result(
+                        detection, frame
+                    )
+                    self._clear_pending_popup_result()
+                    self.logger.info(
+                        "POPUP RESULT VERIFIED BY REPEATED HISTORY "
+                        "id=%s item=%s confirmations=%s",
+                        pending_id,
+                        actual_code,
+                        self.history_verifier.required_confirmations,
+                    )
+                else:
+                    self._notify_failure(
+                        "RESULT_VERIFICATION_TIMEOUT",
+                        "Popup result is still waiting for a stable eight-slot history shift",
+                        {
+                            "resultId": self.pending_popup_result_id,
+                            "popupCode": self.pending_popup_result_code,
+                            "historyConfirmations": self.history_verifier.confirmations,
+                            "sequence": sequence,
+                        },
+                        self.detector.annotate(frame, detection),
+                    )
             if elapsed >= self.round_interval:
                 self.no_result_attempts += 1
                 if (
@@ -906,7 +1482,12 @@ class GreedyScanner:
                 if (
                     self.no_result_attempts >= self.max_failed_attempts
                     and elapsed >= self.round_interval + self.max_failed_attempts * self.scan_interval
-                    and time.monotonic() - self.last_popup_dismiss_monotonic >= self.popup_result_grace
+                    and time.monotonic()
+                    - max(
+                        self.last_popup_seen_monotonic,
+                        self.last_popup_dismiss_monotonic,
+                    )
+                    >= self.popup_result_grace
                 ):
                     self._notify_failure(
                         "RESULT_TIMEOUT",
@@ -942,7 +1523,13 @@ class GreedyScanner:
                 self.current_round = observed_round
                 self.current_round_date = local_date
 
-        self._save_runtime_state("RUNNING", self.previous_sequence)
+        published_sequence = self.previous_sequence
+        if self.pending_popup_result_code is not None:
+            published_sequence = [
+                self.pending_popup_result_code,
+                *(self.previous_sequence or [])[:7],
+            ]
+        self._save_runtime_state("RUNNING", published_sequence)
         return {
             "status": "recorded" if recorded else "waiting",
             "recordedIds": recorded,
@@ -981,9 +1568,13 @@ class GreedyScanner:
             if once:
                 break
             interval = self.scan_interval
+            latest_popup_activity = max(
+                self.last_popup_seen_monotonic,
+                self.last_popup_dismiss_monotonic,
+            )
             if (
-                self.last_popup_dismiss_monotonic > 0
-                and time.monotonic() - self.last_popup_dismiss_monotonic
+                latest_popup_activity > 0
+                and time.monotonic() - latest_popup_activity
                 < self.post_popup_fast_window
             ):
                 interval = self.post_popup_scan_interval
@@ -991,7 +1582,9 @@ class GreedyScanner:
             if remaining > 0:
                 time.sleep(remaining)
         self._collect_countdown_detection()
+        self._collect_round_detection()
         self.countdown_executor.shutdown(wait=False, cancel_futures=True)
+        self.round_executor.shutdown(wait=False, cancel_futures=True)
         self.frame_source.window_capture.close()
         self._save_runtime_state("STOPPED")
         return 0

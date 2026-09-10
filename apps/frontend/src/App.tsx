@@ -1,5 +1,7 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
+import { ITEM_META, ITEM_ORDER } from './items'
+import PlayDemo from './PlayDemo'
 import type {
   AiPredictionResponse,
   AdminSession,
@@ -18,15 +20,23 @@ import type {
   Subscriber,
 } from './types'
 
-const RESULTS_BATCH_SIZE = 30
+const MOBILE_RESULTS_BATCH_SIZE = 10
 const PAGE_SIZES = [30, 50, 100, 500, 1000, 2000, 5000]
-const STATUS_POLL_INTERVAL_MS = 400
+const STATUS_POLL_INTERVAL_MS = 250
 
 type SelectedBucketState = {
   category: 'VEGETABLE' | 'MEAT'
   bucket: StreakBucket
   loading: boolean
   error: string | null
+}
+
+type ResultAnnouncement = {
+  resultId: number
+  round: number | null
+  code: string
+  verified: boolean
+  corrected: boolean
 }
 const bangkokDatePartsFormatter = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -40,21 +50,6 @@ const timeFormatter = new Intl.DateTimeFormat('vi-VN', {
 const localDateFormatter = new Intl.DateTimeFormat('vi-VN', {
   weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC',
 })
-
-const ITEM_META: Record<string, { name: string; icon: string; category: Category; payout?: number }> = {
-  CA_ROT: { name: 'Cà rốt', icon: '🥕', category: 'VEGETABLE', payout: 5 },
-  NGO: { name: 'Ngô', icon: '🌽', category: 'VEGETABLE', payout: 5 },
-  CAI: { name: 'Cải', icon: '🥬', category: 'VEGETABLE', payout: 5 },
-  CA_CHUA: { name: 'Cà chua', icon: '🍅', category: 'VEGETABLE', payout: 5 },
-  BANH_MI: { name: 'Bánh mì', icon: '🌭', category: 'MEAT', payout: 10 },
-  XIEN: { name: 'Xiên', icon: '🍢', category: 'MEAT', payout: 15 },
-  DUI: { name: 'Đùi', icon: '🍗', category: 'MEAT', payout: 25 },
-  BO: { name: 'Bò', icon: '🥩', category: 'MEAT', payout: 45 },
-  PIZZA: { name: 'Nổ Pizza', icon: '🍕', category: 'SPECIAL' },
-  SALAD: { name: 'Nổ Xà lách', icon: '🥗', category: 'SPECIAL' },
-}
-
-const ITEM_ORDER = ['CA_ROT', 'NGO', 'CAI', 'CA_CHUA', 'BANH_MI', 'XIEN', 'DUI', 'BO', 'PIZZA', 'SALAD']
 
 const emptyPage: Page<ResultItem> = {
   items: [], page: 1, pageSize: 30, totalItems: 0, totalPages: 0,
@@ -92,9 +87,11 @@ function sameStatusDisplay(current: ScannerStatus | null, next: ScannerStatus, i
   return current.status === next.status &&
     current.isOnline === next.isOnline &&
     current.lastResultId === next.lastResultId &&
+    current.lastResultRevision === next.lastResultRevision &&
     current.offlineAfterSeconds === next.offlineAfterSeconds &&
     current.sourceSerial === next.sourceSerial &&
     current.currentRound === next.currentRound &&
+    current.activeRound === next.activeRound &&
     (!includeHeartbeat || current.lastHeartbeatUtc === next.lastHeartbeatUtc) &&
     current.lastSequence.length === next.lastSequence.length &&
     current.lastSequence.every((value, index) => value === next.lastSequence[index])
@@ -151,7 +148,11 @@ function NextResultCountdown({
   const waiting = hasScreenTime && remainingSeconds === 0
   const timeText = hasScreenTime ? `00:${String(remainingSeconds).padStart(2, '0')}` : '--:--'
   const progress = hasScreenTime ? ((30 - remainingSeconds) / 30) * 100 : 0
-  const nextRound = (snapshot?.currentRound ?? 0) + 1
+  const nextRound = snapshot?.activeRound ?? (
+    snapshot?.currentRound === null || snapshot?.currentRound === undefined
+      ? null
+      : snapshot.currentRound + 1
+  )
 
   return (
     <section
@@ -238,6 +239,52 @@ function Sequence({ values }: { values: string[] }) {
         )
       })}
     </div>
+  )
+}
+
+function ResultAnnouncementPopup({
+  announcement,
+  onClose,
+}: {
+  announcement: ResultAnnouncement
+  onClose: () => void
+}) {
+  const item = ITEM_META[announcement.code] ?? {
+    name: announcement.code,
+    icon: '•',
+    category: 'SPECIAL' as Category,
+  }
+  const resultName = item.name.startsWith('Nổ ') ? item.name : `Nổ ${item.name}`
+  const popupRef = useRef<HTMLElement>(null)
+
+  useEffect(() => {
+    const closeWhenClickingOutside = (event: PointerEvent) => {
+      if (popupRef.current && !popupRef.current.contains(event.target as Node)) onClose()
+    }
+    document.addEventListener('pointerdown', closeWhenClickingOutside)
+    return () => document.removeEventListener('pointerdown', closeWhenClickingOutside)
+  }, [onClose])
+
+  return (
+    <aside
+      ref={popupRef}
+      className={`result-announcement ${item.category.toLowerCase()} ${announcement.verified ? 'verified' : 'pending'} ${announcement.corrected ? 'corrected' : ''}`}
+      role="status"
+      aria-live="assertive"
+      aria-atomic="true"
+    >
+      <button type="button" onClick={onClose} aria-label="Đóng thông báo kết quả">×</button>
+      <div className="result-announcement-icon" aria-hidden="true">{item.icon}</div>
+      <div className="result-announcement-copy">
+        <small>{announcement.corrected ? 'KẾT QUẢ ĐÃ ĐƯỢC SỬA' : 'CẦU MỚI VỀ'}</small>
+        <strong>{resultName}</strong>
+        <span>
+          Round {announcement.round ?? '—'} · {announcement.verified
+            ? 'Đã đối chiếu đủ 8 cầu'
+            : 'Đang hậu kiểm 8 cầu'}
+        </span>
+      </div>
+    </aside>
   )
 }
 
@@ -526,6 +573,7 @@ function App() {
   const [days, setDays] = useState<DailySummary[]>([])
   const [status, setStatus] = useState<ScannerStatus | null>(null)
   const [results, setResults] = useState<Page<ResultItem>>(emptyPage)
+  const [latestResults, setLatestResults] = useState<ResultItem[]>([])
   const [events, setEvents] = useState<ScannerEvent[]>([])
   const [alerts, setAlerts] = useState<AlertDelivery[]>([])
   const [prediction, setPrediction] = useState<Prediction | null>(null)
@@ -544,10 +592,12 @@ function App() {
   const [pageSize, setPageSize] = useState(30)
   const [customSize, setCustomSize] = useState('250')
   const [customMode, setCustomMode] = useState(false)
-  const [resultsLimit, setResultsLimit] = useState(RESULTS_BATCH_SIZE)
+  const [resultsLimit, setResultsLimit] = useState(MOBILE_RESULTS_BATCH_SIZE)
   const [mobileResults, setMobileResults] = useState(() => window.matchMedia('(max-width: 760px)').matches)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [resultAnnouncement, setResultAnnouncement] = useState<ResultAnnouncement | null>(null)
+  const [playDemoOpen, setPlayDemoOpen] = useState(false)
   const [selectedBucket, setSelectedBucket] = useState<SelectedBucketState | null>(null)
   const [streakSummaryOpen, setStreakSummaryOpen] = useState(false)
   const [phoneNumber, setPhoneNumber] = useState('')
@@ -566,13 +616,36 @@ function App() {
   const statsRequestId = useRef(0)
   const resultsRequestId = useRef(0)
   const bucketRequestId = useRef(0)
-  const statusTracker = useRef<{ initialized: boolean; lastResultId: number | null }>({ initialized: false, lastResultId: null })
+  const statusTracker = useRef<{
+    initialized: boolean
+    lastResultId: number | null
+    lastResultRevision: string | null
+    lastResultCode: string | null
+  }>({ initialized: false, lastResultId: null, lastResultRevision: null, lastResultCode: null })
   const liveStatusRef = useRef<ScannerStatus | null>(null)
   const lastHeartbeatCommit = useRef(0)
+  const resultAnnouncementTimer = useRef<number | undefined>(undefined)
   const statisticsDateInputRef = useRef<HTMLInputElement>(null)
   const openingDatePicker = useRef(false)
   const resultsScrollRef = useRef<HTMLDivElement>(null)
   const resultsLoadMoreRef = useRef<HTMLDivElement>(null)
+
+  const showResultAnnouncement = useCallback((announcement: ResultAnnouncement) => {
+    if (resultAnnouncementTimer.current !== undefined) {
+      window.clearTimeout(resultAnnouncementTimer.current)
+    }
+    setResultAnnouncement(announcement)
+    resultAnnouncementTimer.current = window.setTimeout(() => {
+      setResultAnnouncement(null)
+      resultAnnouncementTimer.current = undefined
+    }, 8000)
+  }, [])
+
+  useEffect(() => () => {
+    if (resultAnnouncementTimer.current !== undefined) {
+      window.clearTimeout(resultAnnouncementTimer.current)
+    }
+  }, [])
 
   const refreshStats = useCallback(async (deferred = false) => {
     const requestId = ++statsRequestId.current
@@ -593,16 +666,20 @@ function App() {
     const requestId = ++resultsRequestId.current
     if (!silent) setLoading(true)
     try {
-      const nextResults = await api.results(
-        mobileResults ? 1 : page,
-        mobileResults ? resultsLimit : pageSize,
-        selectedDate,
-      )
+      const requestedPage = mobileResults ? 1 : page
+      const requestedSize = mobileResults ? resultsLimit : pageSize
+      const [nextResults, firstPage] = await Promise.all([
+        api.results(requestedPage, requestedSize, selectedDate),
+        requestedPage === 1 && requestedSize >= 8
+          ? Promise.resolve(null)
+          : api.results(1, 8, selectedDate),
+      ])
       if (requestId !== resultsRequestId.current) return
       // The latest result is the primary realtime surface. Commit it
       // immediately; deferring this large table update can visibly trail the
       // already completed status request on slower phones.
       setResults(nextResults)
+      setLatestResults((firstPage ?? nextResults).items.slice(0, 8))
       setError(null)
     } catch (caught) {
       if (requestId === resultsRequestId.current) {
@@ -750,9 +827,47 @@ function App() {
         liveStatusRef.current = nextStatus
 
         const tracker = statusTracker.current
-        const resultChanged = tracker.initialized && tracker.lastResultId !== nextStatus.lastResultId
+        const nextResultCode = nextStatus.lastSequence[0] ?? null
+        const isNewResult = tracker.initialized &&
+          tracker.lastResultId !== nextStatus.lastResultId &&
+          nextStatus.lastResultId !== null
+        const isResultRevision = tracker.initialized &&
+          tracker.lastResultId === nextStatus.lastResultId &&
+          tracker.lastResultRevision !== nextStatus.lastResultRevision
+        const previousResultCode = tracker.lastResultCode
+        const resultChanged = tracker.initialized && (
+          tracker.lastResultId !== nextStatus.lastResultId ||
+          tracker.lastResultRevision !== nextStatus.lastResultRevision
+        )
         tracker.initialized = true
         tracker.lastResultId = nextStatus.lastResultId
+        tracker.lastResultRevision = nextStatus.lastResultRevision
+        tracker.lastResultCode = nextResultCode
+
+        if (isNewResult && nextResultCode) {
+          showResultAnnouncement({
+            resultId: nextStatus.lastResultId!,
+            round: nextStatus.currentRound,
+            code: nextResultCode,
+            verified: false,
+            corrected: false,
+          })
+        } else if (isResultRevision && nextStatus.lastResultId !== null && nextResultCode) {
+          const corrected = previousResultCode !== null && previousResultCode !== nextResultCode
+          if (corrected) {
+            showResultAnnouncement({
+              resultId: nextStatus.lastResultId,
+              round: nextStatus.currentRound,
+              code: nextResultCode,
+              verified: true,
+              corrected: true,
+            })
+          } else {
+            setResultAnnouncement(current => current?.resultId === nextStatus.lastResultId
+              ? { ...current, verified: true }
+              : current)
+          }
+        }
 
         const now = Date.now()
         const includeHeartbeat = Boolean(adminSession?.isAuthenticated) && now - lastHeartbeatCommit.current >= 5000
@@ -794,14 +909,14 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer)
       document.removeEventListener('visibilitychange', resumeWhenVisible)
     }
-  }, [adminSession?.isAuthenticated, refreshResults, refreshSecondary, refreshStats, selectedDate])
+  }, [adminSession?.isAuthenticated, refreshResults, refreshSecondary, refreshStats, selectedDate, showResultAnnouncement])
 
   useEffect(() => {
     const query = window.matchMedia('(max-width: 760px)')
     function switchResultsMode(event: MediaQueryListEvent) {
       setMobileResults(event.matches)
       setPage(1)
-      setResultsLimit(RESULTS_BATCH_SIZE)
+      setResultsLimit(MOBILE_RESULTS_BATCH_SIZE)
       if (resultsScrollRef.current) resultsScrollRef.current.scrollTop = 0
     }
     query.addEventListener('change', switchResultsMode)
@@ -815,8 +930,8 @@ function App() {
 
     const observer = new IntersectionObserver(entries => {
       if (!entries.some(entry => entry.isIntersecting)) return
-      setResultsLimit(current => Math.min(results.totalItems, current + RESULTS_BATCH_SIZE))
-    }, { root, rootMargin: '0px 0px 160px 0px', threshold: 0.01 })
+      setResultsLimit(current => Math.min(results.totalItems, current + MOBILE_RESULTS_BATCH_SIZE))
+    }, { root, rootMargin: '0px 0px 100px 0px', threshold: 0.01 })
     observer.observe(target)
     return () => observer.disconnect()
   }, [loading, mobileResults, results.items.length, results.totalItems])
@@ -846,6 +961,14 @@ function App() {
     void refreshPrediction()
   }, [latestResultId, refreshPrediction, selectedDate, statsDate])
 
+  const latestSequence = useMemo(
+    () => latestResults.map(result => result.itemCode),
+    [latestResults],
+  )
+  const latestSequenceRound = selectedDate === bangkokToday()
+    ? status?.activeRound ?? status?.currentRound ?? latestResults[0]?.roundNumber ?? null
+    : latestResults[0]?.roundNumber ?? null
+
   const unacknowledgedEvents = useMemo(
     () => events.filter(event => !event.acknowledged && ['ERROR', 'CRITICAL'].includes(event.severity)),
     [events],
@@ -863,7 +986,7 @@ function App() {
   function changeDate(value: string) {
     setSelectedDate(value)
     setPage(1)
-    setResultsLimit(RESULTS_BATCH_SIZE)
+    setResultsLimit(MOBILE_RESULTS_BATCH_SIZE)
     if (resultsScrollRef.current) resultsScrollRef.current.scrollTop = 0
     setSelectedBucket(null)
     setStreakSummaryOpen(false)
@@ -1008,11 +1131,21 @@ function App() {
 
   return (
     <div className="app-shell">
+      {resultAnnouncement && (
+        <ResultAnnouncementPopup
+          announcement={resultAnnouncement}
+          onClose={() => setResultAnnouncement(null)}
+        />
+      )}
       <header className="topbar">
         <div>
           <h1>GREEDY BIGO · LIVE MONITOR</h1>
         </div>
         <div className="topbar-actions">
+          <button type="button" className="play-demo-trigger" onClick={() => setPlayDemoOpen(true)}>
+            <span aria-hidden="true">▶</span>
+            <span><small>TRẢI NGHIỆM</small><strong>Chơi thử ngay</strong></span>
+          </button>
           <div className={`admin-access ${adminSession?.isAuthenticated ? 'authenticated' : ''}`}>
             <span className="admin-access-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none"><path d="M12 3 5 6v5c0 4.7 2.9 8.3 7 10 4.1-1.7 7-5.3 7-10V6l-7-3Z" /><path d="m9.5 12 1.7 1.7 3.5-4" /></svg>
@@ -1052,7 +1185,7 @@ function App() {
             <span className="status-dot" />
             <div>
               <strong>{status?.isOnline ? 'Scanner đang chạy' : 'Scanner ngoại tuyến'}</strong>
-              <small>{adminSession?.isAuthenticated && status?.sourceSerial ? `${status.sourceSerial} · ` : ''}Round {status?.currentRound ?? '—'}</small>
+              <small>{adminSession?.isAuthenticated && status?.sourceSerial ? `${status.sourceSerial} · ` : ''}Round {status?.activeRound ?? status?.currentRound ?? '—'}</small>
             </div>
           </div>
         </div>
@@ -1084,14 +1217,14 @@ function App() {
           <div className="panel-heading">
             <div>
               <p className="panel-kicker">LỊCH SỬ NHẬN DIỆN</p>
-              <h2>8 ô kết quả mới nhất · Round {status?.currentRound ?? '—'}</h2>
+              <h2>8 ô kết quả mới nhất · Round {latestSequenceRound ?? '—'}</h2>
             </div>
             <div className="refresh-meta">
               <span>Tự làm mới: 1 giây</span>
               <RealtimeClock />
             </div>
           </div>
-          <Sequence values={status?.lastSequence ?? []} />
+          <Sequence values={latestSequence} />
         </section>
 
         <section className="panel">
@@ -1186,7 +1319,7 @@ function App() {
               <h2 className="results-title">Danh sách cầu <span>· {selectedDate}</span></h2>
               <span className="muted">
                 {mobileResults
-                  ? `Đã tải ${results.items.length.toLocaleString('vi-VN')} / ${results.totalItems.toLocaleString('vi-VN')} bản ghi · cuộn để xem tiếp`
+                  ? `${results.items.length.toLocaleString('vi-VN')} kết quả mới nhất · tổng ${results.totalItems.toLocaleString('vi-VN')} bản ghi`
                   : `${results.totalItems.toLocaleString('vi-VN')} bản ghi · trang ${results.page} / ${Math.max(1, results.totalPages)}`}
               </span>
             </div>
@@ -1225,7 +1358,7 @@ function App() {
             </div>
           </div>
 
-          <div className="table-wrap results-infinite-scroll" ref={resultsScrollRef}>
+          <div className="table-wrap" ref={resultsScrollRef}>
             <table>
               <thead><tr><th>Round</th><th>Thời gian</th><th>Vật phẩm</th><th>Nhóm / bệt</th></tr></thead>
               <tbody>
@@ -1256,7 +1389,7 @@ function App() {
             {mobileResults && (
               <div className="infinite-results-status" ref={resultsLoadMoreRef}>
                 {results.items.length < results.totalItems
-                  ? <><span className="infinite-spinner" /><span>Đang tải thêm 30 bản ghi…</span></>
+                  ? <><span className="infinite-spinner" /><span>Cuộn để tải thêm 10 cầu…</span></>
                   : results.totalItems > 0 && <span>Đã hiển thị toàn bộ {results.totalItems.toLocaleString('vi-VN')} bản ghi</span>}
               </div>
             )}
@@ -1338,6 +1471,13 @@ function App() {
           </article>
         </section>}
       </main>
+
+      <PlayDemo
+        open={playDemoOpen}
+        status={status}
+        liveStatus={liveStatusRef}
+        onClose={() => setPlayDemoOpen(false)}
+      />
 
       {adminSession?.isAuthenticated && (
         <footer>

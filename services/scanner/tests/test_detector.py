@@ -1,12 +1,15 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
+
+import numpy as np
 
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from detector import HistoryDetector, find_sequence_shift  # noqa: E402
+from detector import DetectionError, HistoryDetector, find_sequence_shift  # noqa: E402
 
 
 class SequenceShiftTests(unittest.TestCase):
@@ -57,6 +60,41 @@ class PizzaOverrideTests(unittest.TestCase):
         self.assertEqual("CAI", code)
         self.assertAlmostEqual(0.938, confidence)
         self.assertFalse(overridden)
+
+
+class PopupResultTests(unittest.TestCase):
+    def setUp(self):
+        self.detector = HistoryDetector.__new__(HistoryDetector)
+        self.detector.reference_width = 720
+        self.detector.reference_height = 1500
+        self.detector.templates = {
+            "NGO": [np.zeros((8, 8, 3), dtype=np.uint8)],
+            "CAI": [np.zeros((8, 8, 3), dtype=np.uint8)],
+        }
+        self.frame = np.zeros((1500, 720, 3), dtype=np.uint8)
+        self.config = {
+            "result_icon": {"x": 250, "y": 900, "width": 220, "height": 230},
+            "result_minimum_confidence": 0.65,
+            "result_minimum_margin": 0.08,
+        }
+
+    def test_primary_popup_icon_is_classified(self):
+        with patch.object(
+            self.detector, "_best_template_score", side_effect=[0.90, 0.51]
+        ):
+            result = self.detector.detect_popup_result(self.frame, self.config)
+
+        self.assertEqual("NGO", result.code)
+        self.assertAlmostEqual(0.90, result.confidence)
+        self.assertAlmostEqual(0.39, result.margin)
+        self.assertEqual((230, 220, 3), result.crop.shape)
+
+    def test_ambiguous_popup_icon_is_rejected(self):
+        with patch.object(
+            self.detector, "_best_template_score", side_effect=[0.70, 0.66]
+        ):
+            with self.assertRaises(DetectionError):
+                self.detector.detect_popup_result(self.frame, self.config)
 
 
 if __name__ == "__main__":

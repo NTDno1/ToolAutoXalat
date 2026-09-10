@@ -89,6 +89,17 @@ class HistoryDetection:
         return min(slot.confidence for slot in self.slots)
 
 
+@dataclass(frozen=True)
+class PopupResultDetection:
+    code: str
+    name: str
+    category: str
+    confidence: float
+    margin: float
+    crop: np.ndarray
+    scores: dict[str, float]
+
+
 class DetectionError(RuntimeError):
     pass
 
@@ -276,6 +287,78 @@ class HistoryDetector:
             marker_score = float(cv2.countNonZero(yellow)) / float(yellow.size)
 
         return HistoryDetection(slots=slots, new_marker_score=marker_score)
+
+    def detect_popup_result(
+        self, frame: np.ndarray, popup_config: dict
+    ) -> PopupResultDetection:
+        """Classify the primary result icon while the five-second popup is visible."""
+        if frame is None or frame.ndim != 3:
+            raise DetectionError("Popup result frame is empty or invalid")
+
+        rect = popup_config.get("result_icon")
+        if not isinstance(rect, dict):
+            raise DetectionError("Popup result icon region is not configured")
+
+        height, width = frame.shape[:2]
+        scale_x = width / self.reference_width
+        scale_y = height / self.reference_height
+        x, y, crop_width, crop_height = self._scaled_rect(rect, scale_x, scale_y)
+        left = max(0, x)
+        top = max(0, y)
+        right = min(width, x + crop_width)
+        bottom = min(height, y + crop_height)
+        crop = frame[top:bottom, left:right].copy()
+        if crop.size == 0:
+            raise DetectionError("Popup result icon region is outside the frame")
+
+        # Popup icons are rendered much larger than the persistent history
+        # icons used to build the templates. Downscale only the matching view;
+        # retain the full-size crop as evidence.
+        match_scale = max(
+            0.2, min(1.0, float(popup_config.get("result_match_scale", 1.0)))
+        )
+        match_crop = crop
+        if match_scale != 1.0:
+            match_crop = cv2.resize(
+                crop,
+                None,
+                fx=match_scale,
+                fy=match_scale,
+                interpolation=cv2.INTER_AREA,
+            )
+        scores = {
+            code: self._best_template_score(match_crop, variants)
+            for code, variants in self.templates.items()
+        }
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_code, confidence = ranked[0]
+        second_score = ranked[1][1]
+        margin = confidence - second_score
+        minimum_confidence = float(
+            popup_config.get("result_minimum_confidence", 0.65)
+        )
+        minimum_margin = float(popup_config.get("result_minimum_margin", 0.08))
+        if confidence < minimum_confidence:
+            raise DetectionError(
+                f"Popup result confidence {confidence:.3f} below "
+                f"{minimum_confidence:.3f}; best={best_code}"
+            )
+        if margin < minimum_margin:
+            raise DetectionError(
+                f"Popup result ambiguous {best_code}; confidence={confidence:.3f}, "
+                f"margin={margin:.3f}"
+            )
+
+        item = ITEMS[best_code]
+        return PopupResultDetection(
+            code=best_code,
+            name=item["name"],
+            category=item["category"],
+            confidence=confidence,
+            margin=margin,
+            crop=crop,
+            scores=scores,
+        )
 
     def crop_history(self, frame: np.ndarray) -> np.ndarray:
         height, width = frame.shape[:2]

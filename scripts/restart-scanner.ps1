@@ -6,6 +6,8 @@ $logDir = Join-Path $runtimeDir 'logs'
 $statePath = Join-Path $runtimeDir 'processes.json'
 $scannerPath = Join-Path $scannerDir 'scanner.py'
 $taskName = 'ToolAutoXalat-Scanner'
+$scannerConfig = Get-Content -LiteralPath (Join-Path $scannerDir 'config.json') -Raw | ConvertFrom-Json
+$expectedSourceSerial = '{0}:{1}' -f $scannerConfig.emulator.adb_host, $scannerConfig.emulator.adb_port
 
 if (Test-Path -LiteralPath $statePath) {
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
@@ -96,7 +98,7 @@ do {
             $heartbeatIsCurrent = $heartbeatUtc -ge $processStartedUtc.AddSeconds(-1)
         }
         $online = $scanner -and $status.isOnline -and $heartbeatIsCurrent -and `
-            $status.sourceSerial -eq '127.0.0.1:5555'
+            $status.sourceSerial -eq $expectedSourceSerial
     } catch { $online = $false }
     if (-not $online) { Start-Sleep -Milliseconds 500 }
 } while ((Get-Date) -lt $deadline -and -not $online)
