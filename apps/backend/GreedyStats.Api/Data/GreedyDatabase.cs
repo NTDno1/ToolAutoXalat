@@ -530,6 +530,63 @@ public sealed class GreedyDatabase
                 // A partial/old scanner state is treated as unavailable.
             }
         }
+        BettingSignalsDto? bettingSignals = null;
+        if (state.TryGetValue("scanner_betting_signals", out var bettingSignalsRaw))
+        {
+            try
+            {
+                using var signalJson = JsonDocument.Parse(bettingSignalsRaw);
+                var root = signalJson.RootElement;
+                var observedAtRaw = root.GetProperty("observedAtUtc").GetString();
+                var signalCountdown = root.GetProperty("countdownSeconds").GetInt32();
+                if (DateTimeOffset.TryParse(
+                        observedAtRaw,
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal,
+                        out var signalObservedAt) &&
+                    signalCountdown is >= 1 and <= 30 &&
+                    (DateTimeOffset.UtcNow - signalObservedAt).TotalSeconds <= 5)
+                {
+                    int? signalRound = null;
+                    if (root.TryGetProperty("round", out var signalRoundElement) &&
+                        signalRoundElement.ValueKind == JsonValueKind.Number &&
+                        signalRoundElement.TryGetInt32(out var parsedSignalRound))
+                    {
+                        signalRound = parsedSignalRound;
+                    }
+                    string? hotItemCode = null;
+                    if (root.TryGetProperty("hotItemCode", out var hotElement) &&
+                        hotElement.ValueKind == JsonValueKind.String)
+                    {
+                        hotItemCode = hotElement.GetString();
+                    }
+                    var signalItems = new List<BettingSignalItemDto>();
+                    foreach (var item in root.GetProperty("items").EnumerateArray())
+                    {
+                        var code = item.GetProperty("itemCode").GetString();
+                        if (string.IsNullOrWhiteSpace(code)) continue;
+                        signalItems.Add(new BettingSignalItemDto(
+                            code,
+                            Math.Clamp(item.GetProperty("coinCount").GetInt32(), 0, 3),
+                            Math.Clamp(item.GetProperty("activityPercent").GetInt32(), 0, 100)));
+                    }
+                    if (signalItems.Count > 0)
+                    {
+                        bettingSignals = new BettingSignalsDto(
+                            signalRound,
+                            signalObservedAt,
+                            signalCountdown,
+                            hotItemCode,
+                            signalItems);
+                    }
+                }
+            }
+            catch (Exception exception) when (
+                exception is JsonException or InvalidOperationException or KeyNotFoundException)
+            {
+                // Incomplete scanner writes and old formats are ignored.
+            }
+        }
         var online = heartbeat.HasValue &&
                      (DateTimeOffset.UtcNow - heartbeat.Value).TotalSeconds <= _offlineAfterSeconds;
         return new ScannerStatusDto(
@@ -545,6 +602,7 @@ public sealed class GreedyDatabase
             activeRound,
             countdownSeconds,
             countdownObservedAt,
+            bettingSignals,
             DateTimeOffset.UtcNow);
     }
 
@@ -604,7 +662,9 @@ public sealed class GreedyDatabase
         }
         var runs = isVegetable ? stats.VegetableRuns : stats.MeatRuns;
         var currentRun = runs.Last();
-        var rule = isVegetable ? "VEGETABLE_STREAK_15" : "MEAT_STREAK_3";
+        var rule = isVegetable
+            ? $"VEGETABLE_STREAK_{vegetableThreshold}"
+            : $"MEAT_STREAK_{meatThreshold}";
         var alertKey = $"{rule}:{currentRun.StartResultId}";
         var payload = JsonSerializer.SerializeToElement(new
         {
@@ -627,6 +687,7 @@ public sealed class GreedyDatabase
     public async Task<string> EnsureAlertAsync(
         AlertCandidate candidate,
         bool webhookConfigured,
+        int retrySeconds,
         CancellationToken cancellationToken = default)
     {
         var initialStatus = webhookConfigured ? "PENDING" : "PENDING_CONFIGURATION";
@@ -641,7 +702,10 @@ public sealed class GreedyDatabase
                 $payload, $createdAt
             );
             UPDATE alert_deliveries SET status='PENDING'
-            WHERE alert_key=$alertKey AND status='PENDING_CONFIGURATION' AND $configured=1;
+            WHERE alert_key=$alertKey AND $configured=1 AND (
+                status='PENDING_CONFIGURATION' OR
+                (status='RETRY' AND (attempted_at_utc IS NULL OR attempted_at_utc <= $retryBefore))
+            );
             SELECT status FROM alert_deliveries WHERE alert_key=$alertKey;
             """;
         command.Parameters.AddWithValue("$alertKey", candidate.AlertKey);
@@ -651,6 +715,9 @@ public sealed class GreedyDatabase
         command.Parameters.AddWithValue("$resultId", candidate.ResultId);
         command.Parameters.AddWithValue("$status", initialStatus);
         command.Parameters.AddWithValue("$configured", webhookConfigured ? 1 : 0);
+        command.Parameters.AddWithValue(
+            "$retryBefore",
+            ToUtcText(DateTime.UtcNow.AddSeconds(-Math.Max(10, retrySeconds))));
         command.Parameters.AddWithValue("$payload", candidate.Payload.GetRawText());
         command.Parameters.AddWithValue("$createdAt", ToUtcText(DateTime.UtcNow));
         return Convert.ToString(await command.ExecuteScalarAsync(cancellationToken))!;
@@ -742,6 +809,8 @@ public sealed class GreedyDatabase
     }
 
     public async Task<SystemEventDeliveryCandidate?> GetNextSystemEventDeliveryAsync(
+        int retrySeconds,
+        int bootstrapMaxAgeMinutes,
         CancellationToken cancellationToken = default)
     {
         await using var connection = await OpenAsync(cancellationToken);
@@ -751,10 +820,20 @@ public sealed class GreedyDatabase
             FROM scanner_events e
             LEFT JOIN system_event_deliveries d ON d.event_id=e.id
             WHERE e.severity IN ('ERROR', 'CRITICAL')
-              AND (d.id IS NULL OR d.status IN ('PENDING', 'PENDING_CONFIGURATION'))
+              AND (
+                  (d.id IS NULL AND e.occurred_at_utc >= $notBefore) OR
+                  d.status IN ('PENDING', 'PENDING_CONFIGURATION') OR
+                  (d.status='RETRY' AND (d.attempted_at_utc IS NULL OR d.attempted_at_utc <= $retryBefore))
+              )
             ORDER BY e.id ASC
             LIMIT 1
             """;
+        command.Parameters.AddWithValue(
+            "$retryBefore",
+            ToUtcText(DateTime.UtcNow.AddSeconds(-Math.Max(10, retrySeconds))));
+        command.Parameters.AddWithValue(
+            "$notBefore",
+            ToUtcText(DateTime.UtcNow.AddMinutes(-Math.Max(1, bootstrapMaxAgeMinutes))));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
         {
@@ -772,6 +851,7 @@ public sealed class GreedyDatabase
     public async Task<string> EnsureSystemEventDeliveryAsync(
         long eventId,
         bool webhookConfigured,
+        int retrySeconds,
         CancellationToken cancellationToken = default)
     {
         var status = webhookConfigured ? "PENDING" : "PENDING_CONFIGURATION";
@@ -781,12 +861,18 @@ public sealed class GreedyDatabase
             INSERT OR IGNORE INTO system_event_deliveries(event_id, status, created_at_utc)
             VALUES ($eventId, $status, $now);
             UPDATE system_event_deliveries SET status='PENDING'
-            WHERE event_id=$eventId AND status='PENDING_CONFIGURATION' AND $configured=1;
+            WHERE event_id=$eventId AND $configured=1 AND (
+                status='PENDING_CONFIGURATION' OR
+                (status='RETRY' AND (attempted_at_utc IS NULL OR attempted_at_utc <= $retryBefore))
+            );
             SELECT status FROM system_event_deliveries WHERE event_id=$eventId;
             """;
         command.Parameters.AddWithValue("$eventId", eventId);
         command.Parameters.AddWithValue("$status", status);
         command.Parameters.AddWithValue("$configured", webhookConfigured ? 1 : 0);
+        command.Parameters.AddWithValue(
+            "$retryBefore",
+            ToUtcText(DateTime.UtcNow.AddSeconds(-Math.Max(10, retrySeconds))));
         command.Parameters.AddWithValue("$now", ToUtcText(DateTime.UtcNow));
         return Convert.ToString(await command.ExecuteScalarAsync(cancellationToken))!;
     }

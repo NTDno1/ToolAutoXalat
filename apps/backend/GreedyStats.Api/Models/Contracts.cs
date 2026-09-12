@@ -127,6 +127,18 @@ public sealed record ScannerEventRequest(
     JsonElement? Details,
     DateTimeOffset? OccurredAtUtc);
 
+public sealed record BettingSignalItemDto(
+    string ItemCode,
+    int CoinCount,
+    int ActivityPercent);
+
+public sealed record BettingSignalsDto(
+    int? Round,
+    DateTimeOffset ObservedAtUtc,
+    int CountdownSeconds,
+    string? HotItemCode,
+    IReadOnlyList<BettingSignalItemDto> Items);
+
 public sealed record ScannerStatusDto(
     string Status,
     bool IsOnline,
@@ -140,6 +152,7 @@ public sealed record ScannerStatusDto(
     int? ActiveRound,
     int? CountdownSeconds,
     DateTimeOffset? CountdownObservedAtUtc,
+    BettingSignalsDto? BettingSignals,
     DateTimeOffset ServerUtc);
 
 public sealed record AlertDeliveryDto(

@@ -19,6 +19,27 @@ class CaptureBlockedError(RuntimeError):
     """The foreground app explicitly prohibits screen capture."""
 
 
+class DeviceConnectionError(RuntimeError):
+    """A real connection attempt could not reach the selected Android device."""
+
+
+class ReconnectPendingError(RuntimeError):
+    """The source is waiting for its configured reconnect interval."""
+
+
+def is_adb_connection_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(fragment in lowered for fragment in (
+        "device offline",
+        "device not found",
+        "is not connected",
+        "no devices/emulators found",
+        "cannot connect",
+        "closed",
+        "transport error",
+    ))
+
+
 def secure_focused_window(dump: str) -> str | None:
     focus = re.search(r"mCurrentFocus=Window\{(\S+)\s+[^}]+\}", dump)
     if not focus:
@@ -138,11 +159,14 @@ class AdbFrameSource:
     def connect(self) -> None:
         self.last_connect_attempt = time.monotonic()
         self.connected = False
-        if self.endpoint:
-            result = run_adb(self.adb_path, ["connect", self.endpoint])
-            if result.returncode:
-                raise RuntimeError(adb_error(result))
-        device = select_device(list_devices(self.adb_path), self.serial or self.endpoint, self.kind)
+        try:
+            if self.endpoint:
+                result = run_adb(self.adb_path, ["connect", self.endpoint])
+                if result.returncode:
+                    raise RuntimeError(adb_error(result))
+            device = select_device(list_devices(self.adb_path), self.serial or self.endpoint, self.kind)
+        except RuntimeError as exc:
+            raise DeviceConnectionError(str(exc)) from exc
         # Pin this serial; reconnect must never switch to a different phone.
         self.serial = device.serial
         self.connected = True
@@ -153,7 +177,7 @@ class AdbFrameSource:
             raise CaptureBlockedError(self.blocked_message)
         if not self.connected:
             if time.monotonic() - self.last_connect_attempt < self.reconnect_interval:
-                raise RuntimeError(f"Waiting to reconnect device {self.serial}")
+                raise ReconnectPendingError(f"Waiting to reconnect device {self.serial}")
             self.connect()
         try:
             result = run_adb(self.adb_path, ["-s", self.serial, "exec-out", "screencap", "-p"], self.timeout)
@@ -179,6 +203,8 @@ class AdbFrameSource:
                 self.blocked_until = time.monotonic() + 5
                 raise CaptureBlockedError(self.blocked_message) from exc
             self.connected = False
+            if is_adb_connection_error(str(exc)):
+                raise DeviceConnectionError(str(exc)) from exc
             raise
         self.last_raw_frame = frame
         output = self.normalizer.normalize(frame)

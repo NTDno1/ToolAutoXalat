@@ -82,6 +82,20 @@ export interface DailySummary {
   longestMeatStreak: number
 }
 
+export interface BettingSignalItem {
+  itemCode: string
+  coinCount: number
+  activityPercent: number
+}
+
+export interface BettingSignals {
+  round: number | null
+  observedAtUtc: string
+  countdownSeconds: number
+  hotItemCode: string | null
+  items: BettingSignalItem[]
+}
+
 export interface ScannerStatus {
   status: string
   isOnline: boolean
@@ -95,6 +109,7 @@ export interface ScannerStatus {
   activeRound: number | null
   countdownSeconds: number | null
   countdownObservedAtUtc: string | null
+  bettingSignals: BettingSignals | null
   serverUtc: string
 }
 

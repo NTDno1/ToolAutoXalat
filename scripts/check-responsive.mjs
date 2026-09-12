@@ -140,6 +140,8 @@ try {
       hasNextCountdown: document.querySelector('.next-result-countdown') !== null,
       countdownText: document.querySelector('.countdown-ring span')?.textContent ?? '',
       countdownRound: document.querySelector('.countdown-round strong')?.textContent ?? '',
+      liveBettingItems: document.querySelectorAll('.live-betting-item').length,
+      liveHotItems: document.querySelectorAll('.live-betting-item.hot').length,
       predictionPanels: document.querySelectorAll('.prediction-panel').length,
       predictionCards: document.querySelectorAll('.prediction-item').length,
       tableColumns: document.querySelectorAll('table thead th').length,

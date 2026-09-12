@@ -20,7 +20,9 @@ import time
 import cv2
 import numpy as np
 
-from adb_capture import AdbFrameSource, adb_error, run_adb
+from adb_capture import (AdbFrameSource, DeviceConnectionError,
+                         ReconnectPendingError, adb_error,
+                         is_adb_connection_error, run_adb)
 
 
 def resolve_program(configured: str, name: str) -> str:
@@ -107,7 +109,11 @@ class ScrcpyFrameSource(AdbFrameSource):
     def _checked_adb(self, args, timeout=10):
         result = run_adb(self.adb_path, ["-s", self.serial, *args], timeout)
         if result.returncode:
-            raise RuntimeError(adb_error(result) or f"ADB {args[0]} failed")
+            message = adb_error(result) or f"ADB {args[0]} failed"
+            if is_adb_connection_error(message):
+                self.connected = False
+                raise DeviceConnectionError(message)
+            raise RuntimeError(message)
         return result
 
     def _spawn_thread(self, target, *args):
@@ -254,6 +260,9 @@ class ScrcpyFrameSource(AdbFrameSource):
             self._spawn_thread(self._feed_decoder, first_chunk)
             self._spawn_thread(self._read_frames)
             self.connected = True
+        except DeviceConnectionError:
+            self.close()
+            raise
         except (OSError, ValueError, subprocess.TimeoutExpired, RuntimeError) as exc:
             self.close()
             raise RuntimeError(f"scrcpy capture startup failed: {exc}") from exc
@@ -262,7 +271,7 @@ class ScrcpyFrameSource(AdbFrameSource):
         self.normalizer.bounds = None
         if not self.connected:
             if time.monotonic() - self.last_connect_attempt < self.reconnect_interval:
-                raise RuntimeError(f"Waiting to reconnect scrcpy device {self.serial}")
+                raise ReconnectPendingError(f"Waiting to reconnect scrcpy device {self.serial}")
             self.connect()
         deadline = time.monotonic() + self.timeout
         error = ""

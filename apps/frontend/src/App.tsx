@@ -92,6 +92,7 @@ function sameStatusDisplay(current: ScannerStatus | null, next: ScannerStatus, i
     current.sourceSerial === next.sourceSerial &&
     current.currentRound === next.currentRound &&
     current.activeRound === next.activeRound &&
+    JSON.stringify(current.bettingSignals) === JSON.stringify(next.bettingSignals) &&
     (!includeHeartbeat || current.lastHeartbeatUtc === next.lastHeartbeatUtc) &&
     current.lastSequence.length === next.lastSequence.length &&
     current.lastSequence.every((value, index) => value === next.lastSequence[index])
@@ -188,6 +189,56 @@ function NextResultCountdown({
       <div className="countdown-progress" aria-hidden="true">
         <span style={{ width: `${progress}%` }} />
       </div>
+    </section>
+  )
+}
+
+function LiveBettingSignals({ status }: { status: ScannerStatus | null }) {
+  const signals = status?.bettingSignals
+  if (!status?.isOnline || !signals) return null
+  const byCode = new Map(signals.items.map(item => [item.itemCode, item]))
+  const codes = [
+    'BANH_MI', 'CA_CHUA', 'XIEN', 'CAI',
+    'DUI', 'NGO', 'BO', 'CA_ROT',
+  ]
+  const hotMeta = signals.hotItemCode ? ITEM_META[signals.hotItemCode] : null
+
+  return (
+    <section className="live-betting-signals" aria-live="polite">
+      <div className="live-betting-heading">
+        <div>
+          <p className="panel-kicker">TÍN HIỆU CƯỢC TRỰC TIẾP</p>
+          <h2>Hot và mức người đặt theo màn hình</h2>
+        </div>
+        <div className={`live-hot-summary ${hotMeta ? 'active' : ''}`}>
+          <span>HOT</span>
+          <strong>{hotMeta ? `${hotMeta.icon} ${hotMeta.name}` : 'Đang quét'}</strong>
+        </div>
+      </div>
+      <div className="live-betting-grid">
+        {codes.map(code => {
+          const meta = ITEM_META[code]
+          const signal = byCode.get(code)
+          const coinCount = signal?.coinCount ?? 0
+          const isHot = signals.hotItemCode === code
+          return (
+            <div className={`live-betting-item ${isHot ? 'hot' : ''}`} key={code}>
+              {isHot && <span className="live-hot-badge">HOT</span>}
+              <span className="live-betting-icon" aria-hidden="true">{meta.icon}</span>
+              <strong>{meta.name}</strong>
+              <small>Mức đặt: {coinCount} xu</small>
+              <div className="live-coin-row" aria-label={`${coinCount} đồng xu`}>
+                {[0, 1, 2].map(index => (
+                  <i className={index < coinCount ? 'active' : ''} key={index}>●</i>
+                ))}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+      <p className="live-betting-note">
+        Round {signals.round ?? '—'} · {signals.countdownSeconds}s lúc quét · số xu được đọc trực tiếp dưới từng cửa cược
+      </p>
     </section>
   )
 }
@@ -1199,7 +1250,10 @@ function App() {
       )}
 
       {selectedDate === bangkokToday() && (
-        <NextResultCountdown status={status} liveStatus={liveStatusRef} />
+        <>
+          <NextResultCountdown status={status} liveStatus={liveStatusRef} />
+          <LiveBettingSignals status={status} />
+        </>
       )}
 
       <main>

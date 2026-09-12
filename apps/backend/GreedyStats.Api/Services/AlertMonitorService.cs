@@ -1,5 +1,7 @@
 using System.Net.Http.Json;
+using System.Text.Json;
 using GreedyStats.Api.Data;
+using GreedyStats.Api.Models;
 
 namespace GreedyStats.Api.Services;
 
@@ -9,6 +11,9 @@ public sealed class AlertMonitorService : BackgroundService
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IConfiguration _configuration;
     private readonly ILogger<AlertMonitorService> _logger;
+    private string? _observedResultRevision;
+    private DateTimeOffset _resultRevisionObservedAtUtc;
+    private string? _resultStallAlertedRevision;
 
     public AlertMonitorService(
         GreedyDatabase database,
@@ -31,6 +36,7 @@ public sealed class AlertMonitorService : BackgroundService
             try
             {
                 await EvaluateStreakAlertAsync(stoppingToken);
+                await EvaluateScannerWatchdogAsync(stoppingToken);
                 await EvaluateSystemEventAsync(stoppingToken);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
@@ -44,12 +50,102 @@ public sealed class AlertMonitorService : BackgroundService
         }
     }
 
+    private async Task EvaluateScannerWatchdogAsync(CancellationToken cancellationToken)
+    {
+        if (!_configuration.GetValue("Alerts:ScannerWatchdogEnabled", true))
+        {
+            return;
+        }
+
+        var scanner = await _database.GetScannerStatusAsync(cancellationToken);
+        var now = DateTimeOffset.UtcNow;
+        if (scanner.Status is "NOT_STARTED" or "STOPPED")
+        {
+            _observedResultRevision = null;
+            _resultStallAlertedRevision = null;
+            return;
+        }
+
+        var heartbeatLimit = Math.Max(
+            15,
+            _configuration.GetValue("Alerts:ScannerHeartbeatStaleSeconds", 60));
+        if (scanner.LastHeartbeatUtc is { } heartbeat)
+        {
+            var heartbeatAge = (now - heartbeat).TotalSeconds;
+            if (heartbeatAge >= heartbeatLimit)
+            {
+                var details = JsonSerializer.SerializeToElement(new
+                {
+                    scanner.SourceSerial,
+                    scanner.Status,
+                    scanner.CurrentRound,
+                    heartbeatAgeSeconds = Math.Round(heartbeatAge, 1),
+                    heartbeatStaleAfterSeconds = heartbeatLimit,
+                    scanner.LastHeartbeatUtc
+                });
+                await _database.InsertEventAsync(new ScannerEventRequest(
+                    $"backend:SCANNER_HEARTBEAT_STALLED:{heartbeat:yyyyMMddHHmmssfff}",
+                    "CRITICAL",
+                    "SCANNER_HEARTBEAT_STALLED",
+                    "Scanner bị treo hoặc đã dừng cập nhật heartbeat",
+                    details,
+                    now), cancellationToken);
+                return;
+            }
+        }
+
+        if (
+            !scanner.IsOnline
+            || scanner.Status.StartsWith("PHONE_RECONNECT", StringComparison.Ordinal)
+        )
+        {
+            return;
+        }
+
+        var revision = scanner.LastResultRevision ?? "NO_RESULT";
+        if (!string.Equals(_observedResultRevision, revision, StringComparison.Ordinal))
+        {
+            _observedResultRevision = revision;
+            _resultRevisionObservedAtUtc = now;
+            _resultStallAlertedRevision = null;
+            return;
+        }
+
+        var resultLimit = Math.Max(
+            45,
+            _configuration.GetValue("Alerts:ResultProgressStaleSeconds", 90));
+        var unchangedSeconds = (now - _resultRevisionObservedAtUtc).TotalSeconds;
+        if (
+            unchangedSeconds >= resultLimit
+            && !string.Equals(_resultStallAlertedRevision, revision, StringComparison.Ordinal)
+        )
+        {
+            var details = JsonSerializer.SerializeToElement(new
+            {
+                scanner.SourceSerial,
+                scanner.Status,
+                scanner.CurrentRound,
+                scanner.LastResultId,
+                scanner.LastResultRevision,
+                unchangedSeconds = Math.Round(unchangedSeconds, 1),
+                resultStaleAfterSeconds = resultLimit
+            });
+            await _database.InsertEventAsync(new ScannerEventRequest(
+                $"backend:SCANNER_RESULT_STALLED:{scanner.SourceSerial}:{_resultRevisionObservedAtUtc:yyyyMMddHHmmssfff}",
+                "ERROR",
+                "SCANNER_RESULT_STALLED",
+                "Scanner vẫn online nhưng không ghi nhận được các cầu tiếp theo",
+                details,
+                now), cancellationToken);
+            _resultStallAlertedRevision = revision;
+        }
+    }
+
     private async Task EvaluateStreakAlertAsync(CancellationToken cancellationToken)
     {
-        var vegetableThreshold = _configuration.GetValue("Alerts:VegetableStreakThreshold", 15);
+        var vegetableThreshold = _configuration.GetValue("Alerts:VegetableStreakThreshold", 10);
         var meatThreshold = _configuration.GetValue("Alerts:MeatStreakThreshold", 3);
-        var webhookUrl = (_configuration["Alerts:UserWebhookUrl"] ??
-                          _configuration["Alerts:WebhookUrl"])?.Trim();
+        var webhookUrl = ResolveWebhookUrl();
         var candidate = await _database.GetCurrentAlertCandidateAsync(
             vegetableThreshold,
             meatThreshold,
@@ -60,26 +156,36 @@ public sealed class AlertMonitorService : BackgroundService
         }
 
         var subscribers = await _database.GetSubscribersAsync(true, cancellationToken);
-        var configured = !string.IsNullOrWhiteSpace(webhookUrl) && subscribers.Count > 0;
-        var status = await _database.EnsureAlertAsync(candidate, configured, cancellationToken);
-        if (!configured || status is "DELIVERED" or "FAILED")
+        var configured = !string.IsNullOrWhiteSpace(webhookUrl);
+        var retrySeconds = Math.Max(10, _configuration.GetValue("Alerts:WebhookRetrySeconds", 30));
+        var status = await _database.EnsureAlertAsync(
+            candidate, configured, retrySeconds, cancellationToken);
+        if (!configured || status != "PENDING")
         {
             return;
         }
 
-        var payload = new
-        {
-            type = "STREAK_ALERT",
-            deliveryMode = "BROADCAST",
-            recipientCount = subscribers.Count,
-            alert = candidate.Payload,
-            recipients = subscribers.Select(item => new
+        var categoryName = candidate.Category == "MEAT" ? "Thịt" : "Rau";
+        var payload = CreateEnvelope(
+            candidate.AlertKey,
+            "STREAK_ALERT",
+            candidate.RuleCode,
+            "WARNING",
+            $"Bệt {categoryName} đạt {candidate.StreakLength} cầu",
+            $"Đã xuất hiện {candidate.StreakLength} kết quả {categoryName} liên tục.",
+            DateTimeOffset.UtcNow,
+            new
             {
-                item.Id,
-                item.PhoneNumber,
-                item.DisplayName
-            })
-        };
+                deliveryMode = "BROADCAST",
+                recipientCount = subscribers.Count,
+                alert = candidate.Payload,
+                recipients = subscribers.Select(item => new
+                {
+                    item.Id,
+                    item.PhoneNumber,
+                    item.DisplayName
+                })
+            });
         try
         {
             var client = _httpClientFactory.CreateClient("alert-webhook");
@@ -87,7 +193,7 @@ public sealed class AlertMonitorService : BackgroundService
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             await _database.CompleteAlertAsync(
                 candidate.AlertKey,
-                response.IsSuccessStatusCode ? "DELIVERED" : "FAILED",
+                response.IsSuccessStatusCode ? "DELIVERED" : "RETRY",
                 (int)response.StatusCode,
                 Truncate(body),
                 cancellationToken);
@@ -100,7 +206,7 @@ public sealed class AlertMonitorService : BackgroundService
         {
             await _database.CompleteAlertAsync(
                 candidate.AlertKey,
-                "FAILED",
+                "RETRY",
                 null,
                 Truncate(exception.Message),
                 cancellationToken);
@@ -110,32 +216,37 @@ public sealed class AlertMonitorService : BackgroundService
 
     private async Task EvaluateSystemEventAsync(CancellationToken cancellationToken)
     {
-        var candidate = await _database.GetNextSystemEventDeliveryAsync(cancellationToken);
+        var retrySeconds = Math.Max(10, _configuration.GetValue("Alerts:WebhookRetrySeconds", 30));
+        var bootstrapMaxAgeMinutes = Math.Max(
+            1, _configuration.GetValue("Alerts:SystemEventBootstrapMaxAgeMinutes", 15));
+        var candidate = await _database.GetNextSystemEventDeliveryAsync(
+            retrySeconds, bootstrapMaxAgeMinutes, cancellationToken);
         if (candidate is null)
         {
             return;
         }
-        var webhookUrl = _configuration["Alerts:AdminWebhookUrl"]?.Trim();
+        var webhookUrl = ResolveWebhookUrl();
         var configured = !string.IsNullOrWhiteSpace(webhookUrl);
         var status = await _database.EnsureSystemEventDeliveryAsync(
-            candidate.EventId,
-            configured,
-            cancellationToken);
-        if (!configured || status is "DELIVERED" or "FAILED")
+            candidate.EventId, configured, retrySeconds, cancellationToken);
+        if (!configured || status != "PENDING")
         {
             return;
         }
 
-        var payload = new
-        {
-            type = "SCANNER_SYSTEM_EVENT",
-            eventId = candidate.EventId,
-            candidate.Severity,
+        var payload = CreateEnvelope(
+            $"system-event:{candidate.EventId}",
+            "SCANNER_SYSTEM_EVENT",
             candidate.EventCode,
+            candidate.Severity,
+            "Cảnh báo hệ thống scanner",
             candidate.Message,
-            candidate.Details,
-            candidate.OccurredAtUtc
-        };
+            candidate.OccurredAtUtc,
+            new
+            {
+                eventId = candidate.EventId,
+                details = candidate.Details
+            });
         try
         {
             var client = _httpClientFactory.CreateClient("alert-webhook");
@@ -143,7 +254,7 @@ public sealed class AlertMonitorService : BackgroundService
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             await _database.CompleteSystemEventDeliveryAsync(
                 candidate.EventId,
-                response.IsSuccessStatusCode ? "DELIVERED" : "FAILED",
+                response.IsSuccessStatusCode ? "DELIVERED" : "RETRY",
                 (int)response.StatusCode,
                 Truncate(body),
                 cancellationToken);
@@ -152,7 +263,7 @@ public sealed class AlertMonitorService : BackgroundService
         {
             await _database.CompleteSystemEventDeliveryAsync(
                 candidate.EventId,
-                "FAILED",
+                "RETRY",
                 null,
                 Truncate(exception.Message),
                 cancellationToken);
@@ -162,4 +273,36 @@ public sealed class AlertMonitorService : BackgroundService
 
     private static string Truncate(string value) =>
         value.Length > 2000 ? value[..2000] : value;
+
+    private string? ResolveWebhookUrl() =>
+        new[]
+        {
+            _configuration["Alerts:WebhookUrl"],
+            _configuration["Alerts:UserWebhookUrl"],
+            _configuration["Alerts:AdminWebhookUrl"]
+        }
+        .Select(value => value?.Trim())
+        .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+
+    private static object CreateEnvelope(
+        string notificationId,
+        string type,
+        string eventCode,
+        string severity,
+        string title,
+        string message,
+        DateTimeOffset occurredAtUtc,
+        object data) => new
+        {
+            schemaVersion = "1.0",
+            source = "ToolAutoXalat",
+            notificationId,
+            type,
+            eventCode,
+            severity,
+            title,
+            message,
+            occurredAtUtc,
+            data
+        };
 }

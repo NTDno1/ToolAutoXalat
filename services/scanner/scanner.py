@@ -29,7 +29,10 @@ SRC_DIR = PROJECT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from adb_capture import AdbFrameSource, CaptureBlockedError, list_devices, resolve_adb_path  # noqa: E402
+from adb_capture import (AdbFrameSource, CaptureBlockedError,
+                         DeviceConnectionError, ReconnectPendingError,
+                         list_devices, resolve_adb_path)  # noqa: E402
+from betting_signal_detector import BettingSignalDetector  # noqa: E402
 from screen_geometry import ReferenceLayout  # noqa: E402
 from countdown_detector import CountdownDetection, CountdownDetectionError, CountdownDetector  # noqa: E402
 from database import ScannerDatabase, utc_now  # noqa: E402
@@ -197,6 +200,16 @@ class GreedyScanner:
         self.last_countdown_submit_monotonic = 0.0
         self.last_countdown_seconds: Optional[int] = None
         self.last_countdown_observed_at: Optional[datetime] = None
+        betting_config = self.config.get("betting_signals", {})
+        self.betting_signal_detector = BettingSignalDetector(betting_config)
+        self.betting_signal_scan_interval = max(
+            0.25, float(betting_config.get("scan_interval_seconds", 0.75))
+        )
+        self.last_betting_signal_scan_monotonic = 0.0
+        self.betting_signal_round: Optional[int] = None
+        self.betting_signal_hot: Optional[str] = None
+        self.betting_signal_coin_max: dict[str, int] = {}
+        self.last_betting_signal_countdown: Optional[int] = None
         self.local_timezone = ZoneInfo(
             self.config["round"].get("timezone", "Asia/Bangkok")
         )
@@ -223,6 +236,9 @@ class GreedyScanner:
         self.round_interval = float(scanner["round_interval_seconds"])
         self.max_failed_attempts = int(scanner["max_failed_attempts"])
         self.failure_cooldown = float(scanner["failure_alert_cooldown_seconds"])
+        self.reconnect_alert_after = max(
+            1, int(scanner.get("reconnect_alert_after_attempts", 5))
+        )
         self.save_result_crops = bool(scanner.get("save_result_crops", True))
         self.max_error_captures = max(
             0, int(scanner.get("max_error_captures", 100))
@@ -275,6 +291,8 @@ class GreedyScanner:
         self.current_round_date = None
         self.first_successful_scan = True
         self.capture_failures = 0
+        self.connection_failures = 0
+        self.connection_alert_sent = False
         self.round_failures = 0
         self.no_result_attempts = 0
         self.last_alert_at: dict[str, datetime] = {}
@@ -328,6 +346,73 @@ class GreedyScanner:
         self.countdown_future_observed_at = utc_now()
         self.countdown_future = self.countdown_executor.submit(
             self.countdown_detector.detect, frame.copy()
+        )
+
+    def _update_betting_signals(self, frame: np.ndarray) -> None:
+        if not self.betting_signal_detector.enabled:
+            return
+        seconds = self.last_countdown_seconds
+        observed_at = self.last_countdown_observed_at
+        if seconds is None or observed_at is None or not 1 <= seconds <= 30:
+            return
+        if (utc_now() - observed_at).total_seconds() > 4:
+            return
+        now_monotonic = time.monotonic()
+        if now_monotonic - self.last_betting_signal_scan_monotonic < self.betting_signal_scan_interval:
+            return
+        self.last_betting_signal_scan_monotonic = now_monotonic
+
+        detected_round = self.active_round
+        if detected_round is None and self.current_round is not None:
+            detected_round = self.current_round + 1
+        new_betting_window = (
+            self.last_betting_signal_countdown is not None
+            and self.last_betting_signal_countdown <= 3
+            and seconds >= 20
+        )
+        if detected_round != self.betting_signal_round or new_betting_window:
+            self.betting_signal_round = detected_round
+            self.betting_signal_hot = None
+            self.betting_signal_coin_max = {}
+
+        try:
+            detection = self.betting_signal_detector.detect(frame)
+        except (RuntimeError, ValueError, cv2.error) as exc:
+            self.logger.warning("Betting signal detection skipped: %s", exc)
+            return
+
+        if detection.hot_item_code is not None:
+            self.betting_signal_hot = detection.hot_item_code
+        for item in detection.items:
+            self.betting_signal_coin_max[item.item_code] = max(
+                self.betting_signal_coin_max.get(item.item_code, 0),
+                item.coin_count,
+            )
+        self.last_betting_signal_countdown = seconds
+        observed_utc = utc_now().isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+        payload = {
+            "round": self.betting_signal_round,
+            "observedAtUtc": observed_utc,
+            "countdownSeconds": seconds,
+            "hotItemCode": self.betting_signal_hot,
+            "items": [
+                {
+                    "itemCode": item.item_code,
+                    "coinCount": self.betting_signal_coin_max.get(item.item_code, 0),
+                    "activityPercent": round(
+                        self.betting_signal_coin_max.get(item.item_code, 0)
+                        * 100
+                        / self.betting_signal_detector.max_coins
+                    ),
+                }
+                for item in detection.items
+            ],
+        }
+        self.database.set_state(
+            "scanner_betting_signals",
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
 
     def _publish_active_round(self, number: int, observed_at: datetime) -> bool:
@@ -839,6 +924,53 @@ class GreedyScanner:
         )
         self.logger.error("%s | %s", event_code, message)
 
+    def _record_connection_failure(self, exc: Exception) -> dict:
+        self.connection_failures += 1
+        self._save_runtime_state("PHONE_RECONNECTING")
+        self.logger.warning(
+            "Phone reconnect attempt %s/%s failed: %s",
+            self.connection_failures,
+            self.reconnect_alert_after,
+            exc,
+        )
+        if (
+            self.connection_failures >= self.reconnect_alert_after
+            and not self.connection_alert_sent
+        ):
+            self._notify_failure(
+                "PHONE_CONNECTION_FAILED",
+                f"Không thể kết nối lại điện thoại sau {self.connection_failures} lần thử",
+                {
+                    "serial": self.frame_source.serial,
+                    "attempts": self.connection_failures,
+                    "reconnectIntervalSeconds": self.frame_source.reconnect_interval,
+                    "error": str(exc),
+                },
+            )
+            self.connection_alert_sent = True
+        return {"status": "phone_reconnecting", "error": str(exc)}
+
+    def _record_connection_restored(self) -> None:
+        if self.connection_failures <= 0:
+            return
+        attempts = self.connection_failures
+        now = utc_now()
+        self.database.insert_event(
+            "INFO",
+            "PHONE_RECONNECTED",
+            "Đã kết nối lại điện thoại và tiếp tục quét",
+            {"serial": self.frame_source.serial, "failedAttempts": attempts},
+            source_key=(
+                f"scanner:PHONE_RECONNECTED:"
+                f"{now.strftime('%Y%m%d%H%M%S%f')}"
+            ),
+        )
+        self.logger.info(
+            "Phone reconnected after %s failed attempt(s)", attempts
+        )
+        self.connection_failures = 0
+        self.connection_alert_sent = False
+
     def _save_result_crop(
         self,
         frame: np.ndarray,
@@ -1034,6 +1166,7 @@ class GreedyScanner:
         frame: Optional[np.ndarray] = None
         try:
             frame = self.frame_source.capture()
+            self._record_connection_restored()
             # Detect and dismiss the result dialog before running the much
             # heavier eight-slot matcher. This exposes the updated history row
             # roughly one full detection pass earlier.
@@ -1206,6 +1339,7 @@ class GreedyScanner:
         frame: Optional[np.ndarray] = None
         try:
             frame = self.frame_source.capture()
+            self._record_connection_restored()
             # OCR runs on its own worker so reading the on-screen 30-second
             # timer never delays history matching or result persistence.
             self._schedule_countdown_detection(frame)
@@ -1216,8 +1350,14 @@ class GreedyScanner:
                 self.capture_failures = 0
                 self.no_result_attempts = 0
                 return self._handle_result_popup(frame)
+            self._update_betting_signals(frame)
             detection = self.detector.detect(frame)
             self.capture_failures = 0
+        except ReconnectPendingError as exc:
+            self._save_runtime_state("PHONE_RECONNECT_WAIT")
+            return {"status": "phone_reconnect_wait", "error": str(exc)}
+        except DeviceConnectionError as exc:
+            return self._record_connection_failure(exc)
         except CaptureBlockedError as exc:
             self._save_runtime_state("CAPTURE_BLOCKED")
             self.logger.warning("%s", exc)
@@ -1587,7 +1727,16 @@ class GreedyScanner:
         }
 
     def run(self, once: bool = False) -> int:
-        self.frame_source.connect()
+        while not self.stop_requested:
+            try:
+                self.frame_source.connect()
+                self._record_connection_restored()
+                break
+            except DeviceConnectionError as exc:
+                self._record_connection_failure(exc)
+                if once:
+                    raise
+                time.sleep(self.frame_source.reconnect_interval)
         self.popup_input_serial = self.config.get("popup_dismiss", {}).get("input_serial") or self.frame_source.serial
         self.previous_sequence = self._load_sequence()
         self.last_result_at = self._load_last_result_time()

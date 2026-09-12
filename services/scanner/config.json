@@ -72,6 +72,34 @@
     "white_value_min": 175,
     "white_saturation_max": 100
   },
+  "betting_signals": {
+    "enabled": true,
+    "scan_interval_seconds": 0.75,
+    "reference_width": 720,
+    "reference_height": 1600,
+    "scale_mode": "width",
+    "anchor_y": "top",
+    "max_coins": 3,
+    "coin_hsv_low": [18, 150, 170],
+    "coin_hsv_high": [40, 255, 255],
+    "coin_min_area": 100,
+    "coin_max_area": 800,
+    "coin_min_size": 10,
+    "coin_max_size": 35,
+    "coin_min_fill": 0.35,
+    "hot_min_area": 650,
+    "hot_min_fraction": 0.18,
+    "items": [
+      {"code": "BANH_MI", "coin_region": {"x": 330, "y": 402, "width": 60, "height": 43}, "hot_region": {"x": 370, "y": 280, "width": 75, "height": 55}},
+      {"code": "CA_CHUA", "coin_region": {"x": 145, "y": 480, "width": 70, "height": 40}, "hot_region": {"x": 190, "y": 355, "width": 75, "height": 55}},
+      {"code": "XIEN", "coin_region": {"x": 500, "y": 480, "width": 80, "height": 40}, "hot_region": {"x": 545, "y": 350, "width": 75, "height": 60}},
+      {"code": "CAI", "coin_region": {"x": 80, "y": 647, "width": 70, "height": 43}, "hot_region": {"x": 125, "y": 520, "width": 75, "height": 60}},
+      {"code": "DUI", "coin_region": {"x": 570, "y": 647, "width": 80, "height": 43}, "hot_region": {"x": 615, "y": 520, "width": 80, "height": 60}},
+      {"code": "NGO", "coin_region": {"x": 145, "y": 815, "width": 70, "height": 45}, "hot_region": {"x": 190, "y": 695, "width": 75, "height": 60}},
+      {"code": "BO", "coin_region": {"x": 500, "y": 815, "width": 80, "height": 45}, "hot_region": {"x": 545, "y": 695, "width": 75, "height": 60}},
+      {"code": "CA_ROT", "coin_region": {"x": 325, "y": 890, "width": 70, "height": 45}, "hot_region": {"x": 370, "y": 770, "width": 75, "height": 60}}
+    ]
+  },
   "detection": {
     "minimum_confidence": 0.56,
     "minimum_margin": 0.035,

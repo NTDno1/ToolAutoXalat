@@ -67,6 +67,9 @@ export default function PlayDemo({
   resultRef.current = result
 
   const snapshot = liveStatus.current ?? status
+  const liveSignalsByCode = new Map(
+    (snapshot?.bettingSignals?.items ?? []).map(item => [item.itemCode, item]),
+  )
   const countdown = remainingSeconds(snapshot, nowMs)
   const acceptingBets = Boolean(snapshot?.isOnline) && countdown !== null && countdown > 0 && result === null
   const displayRound = result?.round ?? snapshot?.activeRound ?? (
@@ -234,17 +237,27 @@ export default function PlayDemo({
 
           {MAIN_CODES.map((code, index) => {
             const item = ITEM_META[code]
+            const liveSignal = liveSignalsByCode.get(code)
+            const isHot = snapshot?.bettingSignals?.hotItemCode === code
             return (
               <button
                 type="button"
-                className={`demo-food ${item.category.toLowerCase()} ${POSITIONS[index]} ${result?.code === code ? 'winner' : ''}`}
+                className={`demo-food ${item.category.toLowerCase()} ${POSITIONS[index]} ${result?.code === code ? 'winner' : ''} ${isHot ? 'hot' : ''}`}
                 key={code}
                 disabled={!acceptingBets || balance < selectedChip}
                 onClick={() => placeBet(code)}
               >
+                {isHot && <span className="demo-hot-badge">HOT</span>}
                 <span className="demo-food-image" aria-hidden="true">{item.icon}</span>
                 <strong>{item.name}</strong>
                 <small>Thắng x{item.payout}</small>
+                {liveSignal && (
+                  <span className="demo-crowd-coins" title={`Mức người đặt: ${liveSignal.coinCount} xu`}>
+                    {[0, 1, 2].map(coin => (
+                      <i className={coin < liveSignal.coinCount ? 'active' : ''} key={coin}>●</i>
+                    ))}
+                  </span>
+                )}
                 {(bets[code] ?? 0) > 0 && <b>🪙 {formatPoints(bets[code])}</b>}
               </button>
             )

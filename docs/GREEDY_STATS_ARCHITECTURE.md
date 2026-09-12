@@ -67,22 +67,29 @@ Cấu hình trong `apps/backend/GreedyStats.Api/appsettings.json` hoặc biến 
 
 ```json
 "Alerts": {
-  "VegetableStreakThreshold": 15,
+  "VegetableStreakThreshold": 10,
   "MeatStreakThreshold": 3,
-  "UserWebhookUrl": "https://webhook-zalo-cua-ban.example",
-  "AdminWebhookUrl": "https://webhook-admin-cua-ban.example",
+  "WebhookUrl": "https://webhook-chung-cua-ban.example",
+  "WebhookRetrySeconds": 30,
+  "SystemEventBootstrapMaxAgeMinutes": 15,
   "PollIntervalSeconds": 2
 }
 ```
 
-- `UserWebhookUrl`: nhận payload `STREAK_ALERT` cùng danh sách subscriber khi đạt
-  15 Rau hoặc 3 Thịt liên tục.
-- `AdminWebhookUrl`: nhận `SCANNER_SYSTEM_EVENT` cho lỗi `ERROR/CRITICAL`.
+- `WebhookUrl`: nhận cả `STREAK_ALERT` khi đạt 10 Rau/3 Thịt liên tục và
+  `SCANNER_SYSTEM_EVENT` cho lỗi `ERROR`/`CRITICAL`.
 - Khóa cảnh báo dựa trên rule + ID đầu chuỗi nên worker không gửi trùng.
+- Lỗi HTTP hoặc mất n8n được giữ ở trạng thái `RETRY` và gửi lại sau
+  `WebhookRetrySeconds`.
+- Khi bật webhook lần đầu, chỉ sự kiện hệ thống mới trong khoảng
+  `SystemEventBootstrapMaxAgeMinutes` được đưa vào hàng đợi; sự kiện đã vào hàng
+  đợi tiếp tục retry đến khi n8n nhận thành công.
 
-Backend chỉ gọi `UserWebhookUrl` **một lần** cho mỗi cảnh báo với
-`deliveryMode: "BROADCAST"`, `recipientCount` và mảng `recipients`. Dịch vụ
-webhook chung chịu trách nhiệm phát đồng loạt; backend không gọi riêng từng số.
+Mọi thông báo dùng chung envelope `schemaVersion`, `source`, `notificationId`,
+`type`, `eventCode`, `severity`, `title`, `message`, `occurredAtUtc`, `data`.
+Với cảnh báo bệt, `data` có thêm `deliveryMode: "BROADCAST"`, `recipientCount`,
+`alert` và `recipients`. Dịch vụ webhook chung chịu trách nhiệm phát đồng loạt;
+backend không gọi riêng từng số.
 
 ### Thanh toán đăng ký
 
@@ -106,7 +113,8 @@ trong `apps/backend/GreedyStats.Api/appsettings.json`:
 và `{phone}`. Frontend thay các biến này theo từng đăng ký. Không đặt secret vào
 nhóm `Payment` vì endpoint này được cung cấp công khai cho người thanh toán.
 
-Docker Compose nhận `GREEDY_USER_WEBHOOK_URL` và `GREEDY_ADMIN_WEBHOOK_URL`.
+Docker Compose nhận `GREEDY_WEBHOOK_URL`; hai biến webhook cũ vẫn được giữ để
+tương thích cấu hình trước đây.
 
 ## Dự đoán và cổng AI
 

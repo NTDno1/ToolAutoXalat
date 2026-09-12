@@ -207,6 +207,57 @@ hình. Nếu bật sau khi căn chính xác, tọa độ popup được chuyển
 và gửi tới chính serial đang chụp. Nguồn ADB từ chối `popup_dismiss.input_serial`
 riêng để tránh bấm nhầm thiết bị. Luồng này không đặt cược.
 
+## Tự kết nối lại và cảnh báo webhook
+
+Nguồn điện thoại thử kết nối lại đúng theo `source.reconnect_interval_seconds`;
+cấu hình Redmi đặt giá trị này là **5 giây**. Các vòng lặp chờ giữa hai lần thử
+không bị tính thành một lần thất bại. Sau **5 lần kết nối thật sự thất bại**
+(`scanner.reconnect_alert_after_attempts`), scanner tạo sự kiện
+`PHONE_CONNECTION_FAILED`. Khi thiết bị trở lại, bộ đếm được xóa và scanner tiếp
+tục từ hàng lịch sử hiện tại để khôi phục các vòng bị bỏ lỡ.
+
+Backend chuyển mọi sự kiện `ERROR`/`CRITICAL` và cảnh báo bệt tới cùng
+`Alerts:WebhookUrl`.
+Watchdog chạy độc lập với scanner và tạo thêm hai loại cảnh báo:
+
+- `SCANNER_HEARTBEAT_STALLED`: tiến trình scanner treo hoặc không cập nhật trong
+  `ScannerHeartbeatStaleSeconds` (mặc định 60 giây).
+- `SCANNER_RESULT_STALLED`: scanner còn hoạt động nhưng không ghi nhận cầu mới
+  trong `ResultProgressStaleSeconds` (mặc định 90 giây).
+
+Đặt URL bí mật trong `apps/backend/GreedyStats.Api/appsettings.Secrets.json`:
+
+```json
+{
+  "Alerts": {
+    "WebhookUrl": "https://dia-chi-webhook-cua-ban"
+  }
+}
+```
+
+Sau khi thay đổi URL, chạy `scripts/restart-backend.ps1 -SkipBuild`. Không đặt URL
+thật trong `appsettings.json` vì tệp đó được lưu trong Git.
+
+Quy tắc mặc định gửi một lần khi chuỗi đạt **3 Thịt liên tục** hoặc **10 Rau
+liên tục**. Cùng một chuỗi không gửi lại ở các mức 4, 5…; chuỗi mới có khóa mới
+và được gửi bình thường. Payload cảnh báo bệt và lỗi scanner dùng cùng envelope
+JSON để một workflow n8n có thể rẽ nhánh bằng `type` hoặc `eventCode`.
+
+## Quét Hot và mức xu cược
+
+Trong thời gian countdown từ 30 đến 1 giây, scanner đọc tám vùng xu vàng dưới
+các cửa `BANH_MI`, `CA_CHUA`, `XIEN`, `CAI`, `DUI`, `NGO`, `BO`, `CA_ROT` và
+tám vùng có thể xuất hiện nhãn Hot. Dữ liệu được lưu trong
+`scanner_state.scanner_betting_signals`, trả về qua trường `bettingSignals` của
+`GET /api/scanner/status`, rồi hiển thị ở dashboard và màn chơi thử.
+
+Các tọa độ, ngưỡng HSV, diện tích hình xu và nhãn Hot nằm trong phần
+`betting_signals` của từng profile. Tọa độ dùng ảnh tham chiếu 720×1600, scale
+theo chiều rộng và neo phía trên nên tự đổi theo độ phân giải thật mà không làm
+méo bố cục. Scanner giữ mức xu cao nhất đã thấy trong một cửa sổ cược để hiệu ứng
+tay hoặc animation không làm số xu nhấp nháy. API bỏ tín hiệu quá 5 giây, vì vậy
+Hot/xu của vòng cũ tự biến mất khi hết thời gian cược hoặc nguồn hình bị gián đoạn.
+
 ## Kiểm thử
 
 ```powershell
