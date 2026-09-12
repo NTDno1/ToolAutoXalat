@@ -7,6 +7,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from screen_geometry import ReferenceLayout
+
 
 ITEMS: dict[str, dict[str, Any]] = {
     "BANH_MI": {
@@ -109,6 +111,7 @@ class HistoryDetector:
 
     def __init__(self, template_dir: Path, history_config: dict, detection_config: dict):
         self.template_dir = Path(template_dir)
+        self.layout = ReferenceLayout(history_config)
         self.reference_width = int(history_config["reference_width"])
         self.reference_height = int(history_config["reference_height"])
         self.centers_x = [int(value) for value in history_config["slot_centers_x"]]
@@ -177,14 +180,6 @@ class HistoryDetector:
                 "Missing detection templates: " + ", ".join(sorted(set(missing)))
             )
         return loaded
-
-    @staticmethod
-    def _scaled_rect(rect: dict, scale_x: float, scale_y: float) -> tuple[int, int, int, int]:
-        x = round(int(rect["x"]) * scale_x)
-        y = round(int(rect["y"]) * scale_y)
-        width = round(int(rect["width"]) * scale_x)
-        height = round(int(rect["height"]) * scale_y)
-        return x, y, width, height
 
     def _best_template_score(self, slot: np.ndarray, variants: list[np.ndarray]) -> float:
         best = -1.0
@@ -255,15 +250,16 @@ class HistoryDetector:
         if frame is None or frame.ndim != 3:
             raise DetectionError("Frame is empty or has an invalid shape")
         height, width = frame.shape[:2]
-        scale_x = width / self.reference_width
-        scale_y = height / self.reference_height
+        scale_x, scale_y, offset_y = self.layout.transform(frame.shape)
         half_x = max(8, round(self.half_size * scale_x))
         half_y = max(8, round(self.half_size * scale_y))
 
         slots: list[SlotDetection] = []
         for index, reference_x in enumerate(self.centers_x):
             center_x = round(reference_x * scale_x)
-            center_y = round(self.center_y * scale_y)
+            center_y = round(self.center_y * scale_y + offset_y)
+            if center_x - half_x < 0 or center_y - half_y < 0 or center_x + half_x > width or center_y + half_y > height:
+                raise DetectionError(f"Slot {index + 1} is outside the frame; calibrate the screen profile")
             left = max(0, center_x - half_x)
             top = max(0, center_y - half_y)
             right = min(width, center_x + half_x)
@@ -271,11 +267,11 @@ class HistoryDetector:
             slot = frame[top:bottom, left:right]
             if slot.size == 0:
                 raise DetectionError(f"Slot {index + 1} is outside the frame")
+            if scale_x != 1 or scale_y != 1:
+                slot = cv2.resize(slot, (max(1, round(slot.shape[1] / scale_x)), max(1, round(slot.shape[0] / scale_y))), interpolation=cv2.INTER_AREA)
             slots.append(self._classify_slot(slot, index, center_x, center_y))
 
-        marker_x, marker_y, marker_width, marker_height = self._scaled_rect(
-            self.new_marker, scale_x, scale_y
-        )
+        marker_x, marker_y, marker_width, marker_height = self.layout.rect(frame.shape, self.new_marker)
         marker = frame[
             marker_y : marker_y + marker_height,
             marker_x : marker_x + marker_width,
@@ -299,17 +295,13 @@ class HistoryDetector:
         if not isinstance(rect, dict):
             raise DetectionError("Popup result icon region is not configured")
 
-        height, width = frame.shape[:2]
-        scale_x = width / self.reference_width
-        scale_y = height / self.reference_height
-        x, y, crop_width, crop_height = self._scaled_rect(rect, scale_x, scale_y)
-        left = max(0, x)
-        top = max(0, y)
-        right = min(width, x + crop_width)
-        bottom = min(height, y + crop_height)
-        crop = frame[top:bottom, left:right].copy()
-        if crop.size == 0:
-            raise DetectionError("Popup result icon region is outside the frame")
+        layout = ReferenceLayout({"reference_width": self.reference_width,
+                                  "reference_height": self.reference_height, **popup_config})
+        try:
+            crop = layout.crop(frame, rect)
+        except RuntimeError as exc:
+            raise DetectionError(str(exc)) from exc
+        scale_x, scale_y, _ = layout.transform(frame.shape)
 
         # Popup icons are rendered much larger than the persistent history
         # icons used to build the templates. Downscale only the matching view;
@@ -318,12 +310,12 @@ class HistoryDetector:
             0.2, min(1.0, float(popup_config.get("result_match_scale", 1.0)))
         )
         match_crop = crop
-        if match_scale != 1.0:
+        if match_scale != 1.0 or scale_x != 1 or scale_y != 1:
             match_crop = cv2.resize(
                 crop,
                 None,
-                fx=match_scale,
-                fy=match_scale,
+                fx=match_scale / scale_x,
+                fy=match_scale / scale_y,
                 interpolation=cv2.INTER_AREA,
             )
         scores = {
@@ -361,23 +353,16 @@ class HistoryDetector:
         )
 
     def crop_history(self, frame: np.ndarray) -> np.ndarray:
-        height, width = frame.shape[:2]
-        scale_x = width / self.reference_width
-        scale_y = height / self.reference_height
-        x, y, crop_width, crop_height = self._scaled_rect(
-            self.history_crop, scale_x, scale_y
-        )
-        return frame[y : y + crop_height, x : x + crop_width].copy()
+        return self.layout.crop(frame, self.history_crop)
 
     def annotate(self, frame: np.ndarray, detection: HistoryDetection | None) -> np.ndarray:
         output = frame.copy()
-        scale_x = frame.shape[1] / self.reference_width
-        scale_y = frame.shape[0] / self.reference_height
+        scale_x, scale_y, offset_y = self.layout.transform(frame.shape)
         half_x = round(self.half_size * scale_x)
         half_y = round(self.half_size * scale_y)
         for index, reference_x in enumerate(self.centers_x):
             center_x = round(reference_x * scale_x)
-            center_y = round(self.center_y * scale_y)
+            center_y = round(self.center_y * scale_y + offset_y)
             label = "?"
             color = (0, 0, 255)
             if detection and index < len(detection.slots):

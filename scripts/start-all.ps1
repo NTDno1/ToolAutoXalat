@@ -1,5 +1,7 @@
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [string]$ScannerConfig = '',
+    [ValidatePattern('^[^\s"]+$')][string]$Device = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,8 +13,15 @@ $stoppedStatePath = Join-Path $runtimeDir 'processes.stopped.json'
 $backendDir = Join-Path $projectRoot 'apps\backend\GreedyStats.Api'
 $frontendDir = Join-Path $projectRoot 'apps\frontend'
 $scannerDir = Join-Path $projectRoot 'services\scanner'
-$scannerConfig = Get-Content -LiteralPath (Join-Path $scannerDir 'config.json') -Raw | ConvertFrom-Json
-$emulatorSerial = '{0}:{1}' -f $scannerConfig.emulator.adb_host, $scannerConfig.emulator.adb_port
+if (-not $ScannerConfig) { $ScannerConfig = Join-Path $scannerDir 'config.json' }
+$ScannerConfig = (Resolve-Path -LiteralPath $ScannerConfig).Path
+$scannerSettings = Get-Content -LiteralPath $ScannerConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+$sourceSerial = if ($scannerSettings.source.type -eq 'adb') {
+    if ($Device) { $Device } else { $scannerSettings.source.serial }
+} else {
+    if ($Device) { throw '-Device requires an ADB scanner profile.' }
+    '{0}:{1}' -f $scannerSettings.emulator.adb_host, $scannerSettings.emulator.adb_port
+}
 
 New-Item -ItemType Directory -Force -Path $runtimeDir, $logDir | Out-Null
 
@@ -45,6 +54,13 @@ if (-not $SkipBuild) {
 
     & python -m pip install -r (Join-Path $scannerDir 'requirements.txt') --disable-pip-version-check
     if ($LASTEXITCODE -ne 0) { throw 'Scanner dependency install thất bại.' }
+}
+
+if ($scannerSettings.source.type -eq 'adb') {
+    $checkArguments = @((Join-Path $scannerDir 'scanner.py'), '--config', $ScannerConfig, '--check', '--output', (Join-Path $runtimeDir 'scanner-preflight'))
+    if ($Device) { $checkArguments += @('--device', $Device) }
+    & python @checkArguments
+    if ($LASTEXITCODE -ne 0) { throw 'Phone scanner preflight failed. Services have not been started.' }
 }
 
 $backend = Start-Process -FilePath 'dotnet' `
@@ -85,7 +101,8 @@ $state = [ordered]@{
     scannerTaskName = 'ToolAutoXalat-Scanner'
     backendUrl = 'http://127.0.0.1:5117'
     frontendUrl = 'http://127.0.0.1:5173'
-    emulator = $emulatorSerial
+    scannerSourceSerial = $sourceSerial
+    scannerConfigPath = $ScannerConfig
 }
 $previousTunnel = if (Test-Path -LiteralPath $stoppedStatePath) {
     Get-Content -LiteralPath $stoppedStatePath -Raw | ConvertFrom-Json
@@ -101,7 +118,9 @@ if ($previousTunnel.cloudflaredPid) {
 }
 $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8
 
-& (Join-Path $PSScriptRoot 'restart-scanner.ps1')
+$restartArguments = @{ ConfigPath = $ScannerConfig }
+if ($Device) { $restartArguments['Device'] = $Device }
+& (Join-Path $PSScriptRoot 'restart-scanner.ps1') @restartArguments
 $scannerState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
 $scannerPid = [int]$scannerState.scannerPid
 

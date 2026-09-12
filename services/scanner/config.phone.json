@@ -1,0 +1,164 @@
+{
+  "source": {
+    "type": "adb",
+    "adb_path": "",
+    "serial": "",
+    "device_kind": "phone",
+    "connect_address": "",
+    "capture_timeout_seconds": 8,
+    "reconnect_interval_seconds": 3,
+    "capture_backend": "scrcpy",
+    "scrcpy_path": "",
+    "ffmpeg_path": "",
+    "video_max_size": 1600,
+    "video_max_fps": 10,
+    "video_bit_rate": 8000000,
+    "video_startup_timeout_seconds": 15,
+    "video_max_frame_age_seconds": 2
+  },
+  "screen": {
+    "output_width": 720,
+    "orientation": "portrait",
+    "viewport": {
+      "x": 0,
+      "y": 0,
+      "width": 1,
+      "height": 1
+    }
+  },
+  "scanner": {
+    "scan_interval_seconds": 0.75,
+    "post_popup_scan_interval_seconds": 0.5,
+    "post_popup_fast_window_seconds": 8,
+    "round_interval_seconds": 40,
+    "max_failed_attempts": 4,
+    "failure_alert_cooldown_seconds": 30,
+    "save_result_crops": true,
+    "max_error_captures": 100
+  },
+  "popup_dismiss": {
+    "enabled": false,
+    "tap_x": 360,
+    "tap_y": 750,
+    "cooldown_seconds": 8,
+    "result_grace_seconds": 12,
+    "result_confirmations": 2,
+    "result_candidate_timeout_seconds": 1.5,
+    "history_confirmations": 3,
+    "history_confirmation_timeout_seconds": 2,
+    "result_minimum_confidence": 0.65,
+    "result_minimum_margin": 0.08,
+    "result_match_scale": 0.58,
+    "result_icon": {
+      "x": 250,
+      "y": 900,
+      "width": 220,
+      "height": 230
+    },
+    "reference_width": 720,
+    "reference_height": 1500,
+    "max_dim_brightness": 135,
+    "bright_pixel_min": 200,
+    "min_dialog_bright_fraction": 0.35,
+    "dim_region": {
+      "x": 45,
+      "y": 120,
+      "width": 630,
+      "height": 110
+    },
+    "dialog_region": {
+      "x": 0,
+      "y": 850,
+      "width": 720,
+      "height": 650
+    },
+    "scale_mode": "width",
+    "anchor_y": "bottom"
+  },
+  "history": {
+    "reference_width": 720,
+    "reference_height": 1500,
+    "slot_centers_x": [
+      178,
+      244,
+      310,
+      376,
+      442,
+      508,
+      574,
+      640
+    ],
+    "slot_center_y": 1300,
+    "slot_half_size": 36,
+    "crop": {
+      "x": 95,
+      "y": 1245,
+      "width": 600,
+      "height": 110
+    },
+    "new_marker": {
+      "x": 157,
+      "y": 1307,
+      "width": 42,
+      "height": 22
+    },
+    "scale_mode": "width",
+    "anchor_y": "bottom"
+  },
+  "round": {
+    "reference_width": 720,
+    "reference_height": 1500,
+    "crop": {
+      "x": 450,
+      "y": 135,
+      "width": 265,
+      "height": 80
+    },
+    "tesseract_path": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "minimum": 1,
+    "maximum": 999999,
+    "timezone": "Asia/Bangkok",
+    "day_boundary_hour": 23,
+    "scan_interval_seconds": 2.0,
+    "scale_mode": "width",
+    "anchor_y": "top"
+  },
+  "countdown": {
+    "reference_width": 720,
+    "reference_height": 1500,
+    "crop": {
+      "x": 310,
+      "y": 630,
+      "width": 100,
+      "height": 45
+    },
+    "tesseract_path": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "minimum": 0,
+    "maximum": 30,
+    "scan_interval_seconds": 0.75,
+    "white_value_min": 175,
+    "white_saturation_max": 100,
+    "scale_mode": "width",
+    "anchor_y": "top"
+  },
+  "detection": {
+    "minimum_confidence": 0.56,
+    "minimum_margin": 0.035,
+    "high_confidence_override": 0.82,
+    "pizza_override_confidence": 0.58,
+    "template_scale_min": 0.9,
+    "template_scale_max": 1.1,
+    "template_scale_steps": 3,
+    "large_template_max_edge": 48
+  },
+  "paths": {
+    "database": "../../data/greedy_stats.db",
+    "templates": "assets/templates",
+    "captures": "../../data/captures",
+    "logs": "../../runtime/logs"
+  },
+  "backend": {
+    "base_url": "http://127.0.0.1:5117",
+    "request_timeout_seconds": 2
+  }
+}

@@ -29,7 +29,8 @@ SRC_DIR = PROJECT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from bluestacks_capture import TimedBlueStacksWindowCapture  # noqa: E402
+from adb_capture import AdbFrameSource, CaptureBlockedError, list_devices, resolve_adb_path  # noqa: E402
+from screen_geometry import ReferenceLayout  # noqa: E402
 from countdown_detector import CountdownDetection, CountdownDetectionError, CountdownDetector  # noqa: E402
 from database import ScannerDatabase, utc_now  # noqa: E402
 from detector import (  # noqa: E402
@@ -49,6 +50,7 @@ class BlueStacksFrameSource:
     """ADB connection plus Win32 background capture; never sends input."""
 
     def __init__(self, config: dict):
+        from bluestacks_capture import TimedBlueStacksWindowCapture
         self.adb_host = config["adb_host"]
         self.adb_port = int(config["adb_port"])
         self.adb_path = config["adb_path"]
@@ -110,12 +112,50 @@ class BlueStacksFrameSource:
             raise RuntimeError("Captured frame is blank")
         return frame
 
+    def map_input_point(self, x: int, y: int) -> tuple[int, int]:
+        # Legacy BlueStacks config stores Android input coordinates directly.
+        return x, y
+
+    def close(self) -> None:
+        self.window_capture.close()
+
+
+def load_config(config_path: Path, device: str | None = None) -> dict:
+    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    if device:
+        if config.get("source", {}).get("type", "bluestacks") != "adb":
+            raise ValueError("--device requires an ADB profile, e.g. --config services/scanner/config.phone.json")
+        config["source"]["serial"] = device
+        if config["source"].get("connect_address") != device:
+            config["source"]["connect_address"] = ""
+    return config
+
+
+def create_frame_source(config: dict):
+    source = config.get("source", {})
+    source_type = source.get("type", "bluestacks")
+    if source_type == "bluestacks":
+        return BlueStacksFrameSource(config["emulator"])
+    if source_type == "adb":
+        backend = source.get("capture_backend", "screencap")
+        if backend == "scrcpy":
+            from scrcpy_capture import ScrcpyFrameSource
+            return ScrcpyFrameSource(source, config.get("screen"))
+        if backend == "screencap":
+            return AdbFrameSource(source, config.get("screen"))
+        raise ValueError(f"Unknown source.capture_backend: {backend}")
+    raise ValueError(f"Unknown source.type: {source_type}")
+
 
 class GreedyScanner:
-    def __init__(self, config_path: Path):
+    def __init__(self, config_path: Path, device: str | None = None):
         self.config_path = config_path.resolve()
         self.config_dir = self.config_path.parent
-        self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.config = load_config(self.config_path, device)
+        self.frame_source = create_frame_source(self.config)
+        configured_input = self.config.get("popup_dismiss", {}).get("input_serial", "")
+        if isinstance(self.frame_source, AdbFrameSource) and configured_input:
+            raise ValueError("ADB popup input follows the captured device; remove popup_dismiss.input_serial")
 
         paths = self.config["paths"]
         self.database_path = self._resolve(paths["database"])
@@ -127,7 +167,6 @@ class GreedyScanner:
 
         self.logger = self._configure_logging()
         self.database = ScannerDatabase(self.database_path)
-        self.frame_source = BlueStacksFrameSource(self.config["emulator"])
         self.detector = HistoryDetector(
             self.template_dir,
             self.config["history"],
@@ -229,12 +268,11 @@ class GreedyScanner:
         self.backend_timeout = float(backend["request_timeout_seconds"])
 
         self.stop_requested = False
-        self.previous_sequence = self._load_sequence()
-        self.last_result_at = self._load_last_result_time()
-        self.current_round = self._load_round()
-        self.current_round_date = self.database.get_state(
-            self._state_key("round_local_date")
-        )
+        # Restore source-specific state only after auto-selection pins the serial.
+        self.previous_sequence = None
+        self.last_result_at = utc_now()
+        self.current_round = None
+        self.current_round_date = None
         self.first_successful_scan = True
         self.capture_failures = 0
         self.round_failures = 0
@@ -406,6 +444,10 @@ class GreedyScanner:
             return False
 
         try:
+            tap_x, tap_y = ReferenceLayout(self.popup_dismiss_config).point(
+                frame.shape, self.popup_tap_x, self.popup_tap_y
+            )
+            tap_x, tap_y = self.frame_source.map_input_point(tap_x, tap_y)
             result = subprocess.run(
                 [
                     self.frame_source.adb_path,
@@ -414,12 +456,13 @@ class GreedyScanner:
                     "shell",
                     "input",
                     "tap",
-                    str(self.popup_tap_x),
-                    str(self.popup_tap_y),
+                    str(tap_x),
+                    str(tap_y),
                 ],
                 capture_output=True,
                 text=True,
                 timeout=3,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode != 0:
                 self.logger.warning(
@@ -427,7 +470,7 @@ class GreedyScanner:
                     (result.stdout + result.stderr).strip() or result.returncode,
                 )
                 return False
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             self.logger.warning("Popup detected but ADB dismiss failed: %s", exc)
             return False
 
@@ -435,8 +478,8 @@ class GreedyScanner:
         self.logger.info(
             "RESULT_POPUP_DISMISSED serial=%s tap=(%s,%s)",
             self.popup_input_serial,
-            self.popup_tap_x,
-            self.popup_tap_y,
+            tap_x,
+            tap_y,
         )
         return True
 
@@ -1175,6 +1218,10 @@ class GreedyScanner:
                 return self._handle_result_popup(frame)
             detection = self.detector.detect(frame)
             self.capture_failures = 0
+        except CaptureBlockedError as exc:
+            self._save_runtime_state("CAPTURE_BLOCKED")
+            self.logger.warning("%s", exc)
+            return {"status": "capture_blocked", "error": str(exc)}
         except (RuntimeError, DetectionError, OSError) as exc:
             if frame is not None and is_result_popup(
                 frame, self.popup_dismiss_config
@@ -1541,10 +1588,15 @@ class GreedyScanner:
 
     def run(self, once: bool = False) -> int:
         self.frame_source.connect()
+        self.popup_input_serial = self.config.get("popup_dismiss", {}).get("input_serial") or self.frame_source.serial
+        self.previous_sequence = self._load_sequence()
+        self.last_result_at = self._load_last_result_time()
+        self.current_round = self._load_round()
+        self.current_round_date = self.database.get_state(self._state_key("round_local_date"))
         self.database.insert_event(
             "INFO",
             "SCANNER_STARTED",
-            "Scanner đã kết nối BlueStacks và bắt đầu chạy nền",
+            "Scanner đã kết nối thiết bị và bắt đầu quét",
             {"serial": self.frame_source.serial, "intervalSeconds": self.scan_interval},
         )
         self.logger.info(
@@ -1583,11 +1635,16 @@ class GreedyScanner:
                 time.sleep(remaining)
         self._collect_countdown_detection()
         self._collect_round_detection()
-        self.countdown_executor.shutdown(wait=False, cancel_futures=True)
-        self.round_executor.shutdown(wait=False, cancel_futures=True)
-        self.frame_source.window_capture.close()
         self._save_runtime_state("STOPPED")
         return 0
+
+    def close(self) -> None:
+        self.countdown_executor.shutdown(wait=True, cancel_futures=True)
+        self.round_executor.shutdown(wait=True, cancel_futures=True)
+        self.frame_source.close()
+        for handler in self.logger.handlers[:]:
+            self.logger.removeHandler(handler)
+            handler.close()
 
 
 def main() -> int:
@@ -1598,9 +1655,34 @@ def main() -> int:
         help="Path to scanner config.json",
     )
     parser.add_argument("--once", action="store_true", help="Capture/detect once then exit")
+    parser.add_argument("--device", help="Pin an ADB serial from --list-devices")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--list-devices", action="store_true", help="List ADB devices without starting the scanner")
+    actions.add_argument("--check", action="store_true", help="Capture and diagnose without database writes or taps")
+    actions.add_argument("--calibrate", action="store_true", help="Select history/OCR regions on a screenshot and save a profile")
+    actions.add_argument("--calibrate-popup", action="store_true", help="Select popup regions on a result screenshot")
+    parser.add_argument("--image", type=Path, help="Use a saved native screenshot for --check or --calibrate")
+    parser.add_argument("--output", type=Path, default=PROJECT_DIR / "../../runtime/scanner-check", help="Diagnostic directory, or new JSON profile with --calibrate")
     args = parser.parse_args()
 
-    scanner = GreedyScanner(Path(args.config))
+    try:
+        config_path = Path(args.config).resolve()
+        config = load_config(config_path, args.device)
+        if args.list_devices:
+            adb_path = resolve_adb_path(config.get("source", config.get("emulator", {})).get("adb_path", ""))
+            print(json.dumps([d.to_dict() for d in list_devices(adb_path)], ensure_ascii=False, indent=2))
+            return 0
+        if args.check or args.calibrate or args.calibrate_popup:
+            from diagnostics import check_capture, calibrate
+            if args.calibrate or args.calibrate_popup:
+                return calibrate(config, config_path, args.output.resolve(), args.image, popup_only=args.calibrate_popup)
+            return check_capture(config, config_path, args.output.resolve(), args.image)
+        if args.image:
+            parser.error("--image requires --check or --calibrate")
+        scanner = GreedyScanner(config_path, args.device)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Scanner setup failed: {exc}", file=sys.stderr)
+        return 1
 
     def request_stop(_signal, _frame):
         scanner.stop_requested = True
@@ -1618,6 +1700,8 @@ def main() -> int:
         )
         scanner.logger.exception("Scanner crashed")
         return 1
+    finally:
+        scanner.close()
 
 
 if __name__ == "__main__":

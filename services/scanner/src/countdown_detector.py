@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import pytesseract
 
+from screen_geometry import ReferenceLayout
+
 
 class CountdownDetectionError(RuntimeError):
     pass
@@ -48,6 +50,7 @@ class CountdownDetector:
     """Read the 0..30 second label from the center of a normalized game frame."""
 
     def __init__(self, config: dict):
+        self.layout = ReferenceLayout(config)
         self.reference_width = int(config["reference_width"])
         self.reference_height = int(config["reference_height"])
         self.crop_config = dict(config["crop"])
@@ -62,17 +65,10 @@ class CountdownDetector:
     def crop(self, frame: np.ndarray) -> np.ndarray:
         if frame is None or frame.ndim != 3:
             raise CountdownDetectionError("Countdown frame is empty or invalid")
-        height, width = frame.shape[:2]
-        scale_x = width / self.reference_width
-        scale_y = height / self.reference_height
-        x = round(int(self.crop_config["x"]) * scale_x)
-        y = round(int(self.crop_config["y"]) * scale_y)
-        crop_width = round(int(self.crop_config["width"]) * scale_x)
-        crop_height = round(int(self.crop_config["height"]) * scale_y)
-        output = frame[y : y + crop_height, x : x + crop_width].copy()
-        if output.size == 0:
-            raise CountdownDetectionError("Countdown crop is outside the frame")
-        return output
+        try:
+            return self.layout.crop(frame, self.crop_config)
+        except RuntimeError as exc:
+            raise CountdownDetectionError(str(exc)) from exc
 
     def detect(self, frame: np.ndarray) -> CountdownDetection:
         crop = self.crop(frame)

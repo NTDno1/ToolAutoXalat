@@ -1482,7 +1482,7 @@ function App() {
       {adminSession?.isAuthenticated && (
         <footer>
           <span>Backend: 127.0.0.1:5117</span>
-          <span>BlueStacks: {status?.sourceSerial ?? 'Đang kết nối...'}</span>
+          <span>Thiết bị ADB: {status?.sourceSerial ?? 'Đang kết nối...'}</span>
           <span>Heartbeat: {formatDate(status?.lastHeartbeatUtc ?? null)}</span>
         </footer>
       )}

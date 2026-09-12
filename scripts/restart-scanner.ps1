@@ -1,3 +1,8 @@
+param(
+    [string]$ConfigPath = '',
+    [ValidatePattern('^[^\s"]+$')][string]$Device = ''
+)
+
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $scannerDir = Join-Path $projectRoot 'services\scanner'
@@ -6,8 +11,25 @@ $logDir = Join-Path $runtimeDir 'logs'
 $statePath = Join-Path $runtimeDir 'processes.json'
 $scannerPath = Join-Path $scannerDir 'scanner.py'
 $taskName = 'ToolAutoXalat-Scanner'
-$scannerConfig = Get-Content -LiteralPath (Join-Path $scannerDir 'config.json') -Raw | ConvertFrom-Json
-$expectedSourceSerial = '{0}:{1}' -f $scannerConfig.emulator.adb_host, $scannerConfig.emulator.adb_port
+$pythonPath = (Get-Command python -ErrorAction Stop).Source
+if (-not $ConfigPath) { $ConfigPath = Join-Path $scannerDir 'config.json' }
+$ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$scannerConfig = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$scannerArguments = '"{0}" --config "{1}"' -f $scannerPath, $ConfigPath
+if ($scannerConfig.source.type -eq 'adb') {
+    # Validate capture and geometry before stopping a working scanner.
+    $checkDir = Join-Path $runtimeDir 'scanner-preflight'
+    $checkArguments = @($scannerPath, '--config', $ConfigPath, '--check', '--output', $checkDir)
+    if ($Device) { $checkArguments += @('--device', $Device) }
+    & $pythonPath @checkArguments
+    if ($LASTEXITCODE -ne 0) { throw "Phone scanner preflight failed. See $checkDir\report.json. Existing scanner was not stopped." }
+    $preflight = Get-Content -LiteralPath (Join-Path $checkDir 'report.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $expectedSourceSerial = $preflight.serial
+    $scannerArguments += ' --device "{0}"' -f $expectedSourceSerial
+} else {
+    if ($Device) { throw '-Device requires an ADB scanner profile.' }
+    $expectedSourceSerial = '{0}:{1}' -f $scannerConfig.emulator.adb_host, $scannerConfig.emulator.adb_port
+}
 
 if (Test-Path -LiteralPath $statePath) {
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
@@ -47,11 +69,10 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-$pythonPath = (Get-Command python -ErrorAction Stop).Source
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $action = New-ScheduledTaskAction `
     -Execute $pythonPath `
-    -Argument ('"{0}"' -f $scannerPath) `
+    -Argument $scannerArguments `
     -WorkingDirectory $scannerDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
 $settings = New-ScheduledTaskSettingsSet `
@@ -74,7 +95,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description 'Background BlueStacks scanner for ToolAutoXalat; no UI input.' `
+    -Description 'Android result scanner for ToolAutoXalat using the selected device profile.' `
     -Force | Out-Null
 Start-ScheduledTask -TaskName $taskName
 
@@ -90,7 +111,7 @@ do {
         } |
         Select-Object -First 1
     try {
-        $status = Invoke-RestMethod -Uri 'http://127.0.0.1:5117/api/scanner/status' -TimeoutSec 2
+        $status = Invoke-RestMethod -Uri ($scannerConfig.backend.base_url.TrimEnd('/') + '/api/scanner/status') -TimeoutSec 2
         $heartbeatIsCurrent = $false
         if ($scanner -and $status.lastHeartbeatUtc) {
             $heartbeatUtc = [DateTimeOffset]::Parse($status.lastHeartbeatUtc).UtcDateTime
@@ -107,6 +128,8 @@ if (-not $online) { throw "Scanner task did not become online. See $logDir." }
 
 $state | Add-Member -NotePropertyName scannerPid -NotePropertyValue ([int]$scanner.ProcessId) -Force
 $state | Add-Member -NotePropertyName scannerTaskName -NotePropertyValue $taskName -Force
+$state | Add-Member -NotePropertyName scannerConfigPath -NotePropertyValue $ConfigPath -Force
+$state | Add-Member -NotePropertyName scannerSourceSerial -NotePropertyValue $expectedSourceSerial -Force
 $state | Add-Member -NotePropertyName scannerRestartedAt -NotePropertyValue (Get-Date).ToString('o') -Force
 $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath -Encoding utf8
 
