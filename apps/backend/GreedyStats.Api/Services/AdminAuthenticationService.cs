@@ -6,6 +6,7 @@ namespace GreedyStats.Api.Services;
 public sealed class AdminAuthenticationService
 {
     private const string HashPrefix = "PBKDF2-SHA256";
+    public const string CredentialVersionClaim = "admin_credential_version";
     private readonly IConfiguration _configuration;
 
     public AdminAuthenticationService(IConfiguration configuration)
@@ -23,6 +24,21 @@ public sealed class AdminAuthenticationService
         _configuration.GetValue<int?>("Admin:SessionHours") ?? 8,
         1,
         24);
+
+    public int RememberSessionDays => Math.Clamp(
+        _configuration.GetValue<int?>("Admin:RememberSessionDays") ?? 30,
+        1,
+        90);
+
+    public string CredentialVersion
+    {
+        get
+        {
+            var passwordHash = _configuration["Admin:PasswordHash"] ?? string.Empty;
+            var material = $"{Username}\n{passwordHash}";
+            return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(material)));
+        }
+    }
 
     public bool Verify(string? username, string? password)
     {

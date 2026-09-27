@@ -1,5 +1,6 @@
 param(
-    [int]$KeepLatestErrorCaptures = 100
+    [int]$KeepLatestErrorCaptures = 100,
+    [ValidateRange(1, 30)][int]$KeepCaptureDays = 2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,6 +44,33 @@ $errorCaptures = @(
 $oldErrorCaptures = @($errorCaptures | Select-Object -Skip $KeepLatestErrorCaptures)
 $errorBytes = [long]($oldErrorCaptures | Measure-Object -Property Length -Sum).Sum
 
+$captureCutoff = [DateTime]::UtcNow.Date.AddDays(-($KeepCaptureDays - 1))
+$oldCaptureDirectories = @(
+    Get-ChildItem -LiteralPath $captureRoot -Directory -Force |
+        Where-Object {
+            $captureDate = [DateTime]::MinValue
+            [DateTime]::TryParseExact(
+                $_.Name,
+                'yyyy-MM-dd',
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::None,
+                [ref]$captureDate
+            ) -and $captureDate -lt $captureCutoff
+        }
+)
+$oldCaptureBytes = 0L
+$oldCaptureFiles = 0
+foreach ($directory in $oldCaptureDirectories) {
+    if (-not $directory.FullName.StartsWith($captureRoot + $separator, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove an unsafe dated capture path: $($directory.FullName)"
+    }
+    $files = @(
+        Get-ChildItem -LiteralPath $directory.FullName -File -Recurse -Force -ErrorAction SilentlyContinue
+    )
+    $oldCaptureBytes += [long]($files | Measure-Object -Property Length -Sum).Sum
+    $oldCaptureFiles += $files.Count
+}
+
 foreach ($file in $oldErrorCaptures) {
     if (
         -not [string]::Equals($file.DirectoryName, $captureRoot, [StringComparison]::OrdinalIgnoreCase) -or
@@ -58,6 +86,9 @@ foreach ($directory in $temporaryDirectories) {
 foreach ($file in $oldErrorCaptures) {
     Remove-Item -LiteralPath $file.FullName -Force
 }
+foreach ($directory in $oldCaptureDirectories) {
+    Remove-Item -LiteralPath $directory.FullName -Recurse -Force
+}
 
 $driveName = [IO.Path]::GetPathRoot($projectRoot).TrimEnd('\').TrimEnd(':')
 $drive = Get-PSDrive -Name $driveName
@@ -66,6 +97,10 @@ $drive = Get-PSDrive -Name $driveName
     RemovedTemporaryMB = [math]::Round($temporaryBytes / 1MB, 1)
     RemovedOldErrorCaptures = $oldErrorCaptures.Count
     RemovedErrorCaptureMB = [math]::Round($errorBytes / 1MB, 1)
+    RemovedDatedCaptureDirectories = $oldCaptureDirectories.Count
+    RemovedDatedCaptureFiles = $oldCaptureFiles
+    RemovedDatedCaptureMB = [math]::Round($oldCaptureBytes / 1MB, 1)
+    RetainedCaptureDays = $KeepCaptureDays
     RetainedErrorCaptures = @(
         Get-ChildItem -LiteralPath $captureRoot -File -Filter 'error_*.png'
     ).Count

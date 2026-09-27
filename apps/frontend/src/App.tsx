@@ -1,16 +1,22 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api } from './api'
+import { api, getClientDeviceId, getClientDeviceName } from './api'
 import { ITEM_META, ITEM_ORDER } from './items'
 import PlayDemo from './PlayDemo'
 import type {
+  AccessKey,
+  AccessSession,
   AiPredictionResponse,
   AdminSession,
-  AlertDelivery,
+  AlertWebhookConfig,
+  AutoPlayStrategy,
+  AutoPlayStatus,
   Category,
   DailyStats,
   DailySummary,
   Page,
   PaymentConfig,
+  MarketPredictionResponse,
+  PhoneControlStatus,
   Prediction,
   ResultItem,
   ScannerEvent,
@@ -18,11 +24,14 @@ import type {
   StreakBucket,
   StreakRun,
   Subscriber,
+  Visitor,
+  CreatedAccessKey,
 } from './types'
 
 const MOBILE_RESULTS_BATCH_SIZE = 10
 const PAGE_SIZES = [30, 50, 100, 500, 1000, 2000, 5000]
 const STATUS_POLL_INTERVAL_MS = 250
+const RED_SIDE_CODES = new Set(['CA_CHUA', 'BANH_MI', 'CA_ROT', 'BO'])
 
 type SelectedBucketState = {
   category: 'VEGETABLE' | 'MEAT'
@@ -239,6 +248,621 @@ function LiveBettingSignals({ status }: { status: ScannerStatus | null }) {
       <p className="live-betting-note">
         Round {signals.round ?? '—'} · {signals.countdownSeconds}s lúc quét · số xu được đọc trực tiếp dưới từng cửa cược
       </p>
+    </section>
+  )
+}
+
+type PhonePointerState = {
+  pointerId: number
+  startX: number
+  startY: number
+  clientX: number
+  clientY: number
+  startedAt: number
+}
+
+function AutoPlayPanel({ adminSession }: { adminSession: AdminSession | null }) {
+  const [status, setStatus] = useState<AutoPlayStatus | null>(null)
+  const [enabled, setEnabled] = useState(false)
+  const [mode, setMode] = useState<'SIMULATION' | 'LIVE'>('SIMULATION')
+  const [strategy, setStrategy] = useState<AutoPlayStrategy['key']>('CAPITAL_GUARD')
+  const [bankroll, setBankroll] = useState('1000')
+  const [chipValue, setChipValue] = useState('2')
+  const [tapsPerItem, setTapsPerItem] = useState('1')
+  const [maxConsecutiveLosses, setMaxConsecutiveLosses] = useState('2')
+  const [minimumVegetableProbability, setMinimumVegetableProbability] = useState('15')
+  const [minimumMeatProbability, setMinimumMeatProbability] = useState('7')
+  const [maximumSelections, setMaximumSelections] = useState('1')
+  const [lossRecoveryEnabled, setLossRecoveryEnabled] = useState(true)
+  const [lossRecoveryMultiplier, setLossRecoveryMultiplier] = useState('2')
+  const [maximumRecoverySteps, setMaximumRecoverySteps] = useState('2')
+  const [liveAcknowledged, setLiveAcknowledged] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+  const formInitialized = useRef(false)
+  const canControl = adminSession?.isAuthenticated === true
+
+  const applyStatus = useCallback((next: AutoPlayStatus, forceForm = false) => {
+    setStatus(next)
+    if (!formInitialized.current || forceForm) {
+      setEnabled(next.configuration.enabled)
+      setMode(next.configuration.mode)
+      setStrategy(next.configuration.strategy)
+      setBankroll(String(next.configuration.bankrollUnits))
+      setChipValue(String(next.configuration.chipValue))
+      setTapsPerItem(String(next.configuration.tapsPerItem))
+      const selectedSettings = next.configuration.strategySettings.find(item => item.strategy === next.configuration.strategy)
+      if (selectedSettings) {
+        setMaxConsecutiveLosses(String(selectedSettings.maxConsecutiveLosses))
+        setMinimumVegetableProbability(String(selectedSettings.minimumVegetableProbabilityPercent))
+        setMinimumMeatProbability(String(selectedSettings.minimumMeatProbabilityPercent))
+        setMaximumSelections(String(selectedSettings.maximumSelections))
+        setLossRecoveryEnabled(selectedSettings.lossRecoveryEnabled)
+        setLossRecoveryMultiplier(String(selectedSettings.lossRecoveryMultiplier))
+        setMaximumRecoverySteps(String(selectedSettings.maximumRecoverySteps))
+      }
+      setLiveAcknowledged(false)
+      formInitialized.current = true
+    }
+  }, [])
+
+  const refresh = useCallback(async () => {
+    if (!canControl) return
+    try {
+      applyStatus(await api.autoPlayStatus())
+    } catch (caught) {
+      setMessage(caught instanceof Error ? caught.message : 'Không đọc được trạng thái tự động chơi')
+    }
+  }, [applyStatus, canControl])
+
+  useEffect(() => {
+    if (!canControl) return
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 1200)
+    return () => window.clearInterval(timer)
+  }, [canControl, refresh])
+
+  const save = async (enabledOverride?: boolean) => {
+    const enabledValue = enabledOverride ?? enabled
+    const bankrollValue = Number(bankroll)
+    const chipValueNumber = Number.parseInt(chipValue, 10)
+    const tapsValue = Number.parseInt(tapsPerItem, 10)
+    const maxLossesValue = Number.parseInt(maxConsecutiveLosses, 10)
+    const vegetableProbabilityValue = Number(minimumVegetableProbability)
+    const meatProbabilityValue = Number(minimumMeatProbability)
+    const maximumSelectionsValue = Number.parseInt(maximumSelections, 10)
+    const lossRecoveryMultiplierValue = Number(lossRecoveryMultiplier)
+    const maximumRecoveryStepsValue = Number.parseInt(maximumRecoverySteps, 10)
+    if (!Number.isFinite(bankrollValue) || bankrollValue < 10) {
+      setMessage('Vốn phải từ 10 xu trở lên.')
+      return
+    }
+    if (!Number.isFinite(maxLossesValue) || maxLossesValue < 0 || maxLossesValue > 20 ||
+        !Number.isFinite(vegetableProbabilityValue) || vegetableProbabilityValue < 0 || vegetableProbabilityValue > 100 ||
+        !Number.isFinite(meatProbabilityValue) || meatProbabilityValue < 0 || meatProbabilityValue > 100 ||
+        !Number.isFinite(maximumSelectionsValue) || maximumSelectionsValue < 1 || maximumSelectionsValue > 3 ||
+        !Number.isFinite(lossRecoveryMultiplierValue) || lossRecoveryMultiplierValue < 1 || lossRecoveryMultiplierValue > 3 ||
+        !Number.isFinite(maximumRecoveryStepsValue) || maximumRecoveryStepsValue < 0 || maximumRecoveryStepsValue > 5) {
+      setMessage('Kiểm tra lại: chuỗi thua 0–20, xác suất 0–100%, số cửa 1–3, hệ số gỡ 1–3 và tối đa 0–5 bước.')
+      return
+    }
+    if (![2, 10, 50, 100, 1000].includes(chipValueNumber) || !Number.isFinite(tapsValue) || tapsValue < 1 || tapsValue > 5) {
+      setMessage('Chọn đúng mệnh giá và từ 1 đến 5 lần chạm cho mỗi cửa.')
+      return
+    }
+    setSaving(true)
+    setMessage(null)
+    try {
+      const next = await api.saveAutoPlayConfiguration({
+        enabled: enabledValue,
+        mode,
+        strategy,
+        bankrollUnits: bankrollValue,
+        chipValue: chipValueNumber,
+        tapsPerItem: tapsValue,
+        maxConsecutiveLosses: maxLossesValue,
+        minimumVegetableProbabilityPercent: vegetableProbabilityValue,
+        minimumMeatProbabilityPercent: meatProbabilityValue,
+        maximumSelections: maximumSelectionsValue,
+        lossRecoveryEnabled,
+        lossRecoveryMultiplier: lossRecoveryMultiplierValue,
+        maximumRecoverySteps: maximumRecoveryStepsValue,
+        liveModeAcknowledged: liveAcknowledged,
+      })
+      applyStatus(next, true)
+      setMessage(mode === 'LIVE' && enabledValue
+        ? 'Đã bật LIVE với giới hạn vốn đã chọn.'
+        : enabledValue ? 'Đã bật mô phỏng tự động.' : 'Đã lưu và giữ hệ thống ở trạng thái tắt.')
+    } catch (caught) {
+      setMessage(caught instanceof Error ? caught.message : 'Không lưu được cấu hình tự động chơi')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const emergencyStop = async () => {
+    setSaving(true)
+    try {
+      const next = await api.emergencyStopAutoPlay()
+      applyStatus(next, true)
+      setMessage('Đã ngắt khẩn cấp. Không có lệnh mới nào được gửi.')
+    } catch (caught) {
+      setMessage(caught instanceof Error ? caught.message : 'Không thể ngắt tự động chơi')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const activeStrategy = status?.strategies.find(item => item.key === strategy) ?? null
+  const selectStrategy = (key: AutoPlayStrategy['key']) => {
+    setStrategy(key)
+    const settings = status?.configuration.strategySettings.find(item => item.strategy === key)
+    if (!settings) return
+    setMaxConsecutiveLosses(String(settings.maxConsecutiveLosses))
+    setMinimumVegetableProbability(String(settings.minimumVegetableProbabilityPercent))
+    setMinimumMeatProbability(String(settings.minimumMeatProbabilityPercent))
+    setMaximumSelections(String(settings.maximumSelections))
+    setLossRecoveryEnabled(settings.lossRecoveryEnabled)
+    setLossRecoveryMultiplier(String(settings.lossRecoveryMultiplier))
+    setMaximumRecoverySteps(String(settings.maximumRecoverySteps))
+  }
+  const selectMode = (nextMode: 'SIMULATION' | 'LIVE') => {
+    setMode(nextMode)
+    setLiveAcknowledged(false)
+    if (nextMode === 'LIVE') {
+      // The production launcher intentionally limits real-device validation
+      // to one 2-xu tap. Normalize the form before saving so settings left
+      // over from simulation cannot make the server reject LIVE.
+      setChipValue('2')
+      setTapsPerItem('1')
+      setMaximumSelections('1')
+      setLossRecoveryEnabled(false)
+    }
+  }
+  const statusTone = status?.engineStatus === 'ERROR'
+    ? 'danger'
+    : status?.configuration.enabled ? 'active' : 'idle'
+
+  return (
+    <section className="autoplay-panel">
+      <div className="autoplay-heading">
+        <div>
+          <p className="panel-kicker">ADMIN · AUTO PLAY</p>
+          <h2>Tự động đặt theo dự đoán</h2>
+          <p>Đặt 1–3 cửa trong khoảng 20–13 giây. Quyết định hiện chỉ dùng xác suất thống kê; không dùng nhãn HOT hay tín hiệu xu đám đông.</p>
+        </div>
+        <div className="autoplay-heading-actions">
+          <span className={`autoplay-status-pill ${statusTone}`}>{status?.engineStatus ?? 'ĐANG TẢI'}</span>
+          <button
+            className={`autoplay-power-button ${status?.configuration.enabled ? 'running' : ''}`}
+            type="button"
+            onClick={() => void save(!status?.configuration.enabled)}
+            disabled={saving || !status}
+          >
+            {status?.configuration.enabled ? 'DỪNG AUTO PLAY' : 'BẬT AUTO PLAY'}
+          </button>
+          <button className="autoplay-stop-button" type="button" onClick={() => void emergencyStop()} disabled={saving}>
+            NGẮT KHẨN CẤP
+          </button>
+        </div>
+      </div>
+
+      <div className="autoplay-warning">
+        <strong>Không có thuật toán nào đảm bảo thắng.</strong>
+        <span>Gỡ lỗ chỉ tăng tiền trên cầu vẫn đạt xác suất; không bảo đảm gỡ được. Trần vốn, lỗ ngày và số bước luôn được áp dụng, không all-in.</span>
+      </div>
+
+      <div className="autoplay-metrics">
+        <div><small>ROUND / ĐẾM NGƯỢC</small><strong>{status?.activeRound ?? '—'} · {status?.countdownSeconds ?? '--'}s</strong></div>
+        <div><small>SỐ DƯ OCR / DỰ PHÒNG</small><strong>{status?.configuration.detectedBalanceUnits?.toLocaleString('vi-VN') ?? '—'} / {status?.protectedReserveUnits.toLocaleString('vi-VN') ?? '—'} xu</strong></div>
+        <div><small>LÃI/LỖ CƯỢC THUẦN HÔM NAY</small><strong className={(status?.todayNetUnits ?? 0) < 0 ? 'negative' : 'positive'}>{status?.todayNetUnits ?? 0}</strong></div>
+        <div><small>THUA LIÊN TIẾP / BƯỚC GỠ</small><strong>{status?.consecutiveLosses ?? 0} / {status?.currentRecoveryStep ?? 0}</strong></div>
+      </div>
+
+      <div className="autoplay-status-message">{status?.message ?? 'Đang kết nối bộ máy tự động…'}</div>
+
+      <div className="autoplay-strategies">
+        {status?.strategies.map(item => (
+          <button
+            type="button"
+            key={item.key}
+            className={strategy === item.key ? 'selected' : ''}
+            onClick={() => selectStrategy(item.key)}
+          >
+            <strong>{item.name}</strong>
+            <span>{item.description}</span>
+            {(() => {
+              const saved = status.configuration.strategySettings.find(setting => setting.strategy === item.key)
+              return <small>{item.riskLevel} · {saved?.maximumSelections ?? item.maximumSelections} cửa · Rau ≥ {saved?.minimumVegetableProbabilityPercent ?? '—'}% · Thịt ≥ {saved?.minimumMeatProbabilityPercent ?? '—'}% · {saved?.lossRecoveryEnabled ? `gỡ x${saved.lossRecoveryMultiplier}, ${saved.maximumRecoverySteps} bước` : 'không gỡ lỗ'} · {saved?.maxConsecutiveLosses === 0 ? 'không dừng theo chuỗi' : `dừng sau ${saved?.maxConsecutiveLosses ?? item.maxConsecutiveLosses} lần thua`}</small>
+            })()}
+          </button>
+        ))}
+      </div>
+
+      <div className="autoplay-config-grid">
+        <label>
+          <span>Chế độ</span>
+          <select value={mode} onChange={event => selectMode(event.target.value as 'SIMULATION' | 'LIVE')}>
+            <option value="SIMULATION">Mô phỏng — không chạm điện thoại</option>
+            <option value="LIVE" disabled={!status?.configuration.liveExecutionAvailable}>LIVE — đặt trên điện thoại</option>
+          </select>
+          {!status?.configuration.liveExecutionAvailable && <small>LIVE khóa an toàn: chưa có mẫu số dư dương và cược thật để xác nhận OCR/tọa độ ADB.</small>}
+          {mode === 'LIVE' && status?.configuration.liveExecutionAvailable && <small>Máy thật: hệ thống tự dùng 1 cửa × 1 chạm × 2 xu; hãy tích xác nhận rủi ro trước khi bật.</small>}
+        </label>
+        <label>
+          <span>Vốn mô phỏng / vốn chuẩn</span>
+          <input type="number" min="10" step="1" value={bankroll} onChange={event => setBankroll(event.target.value)} />
+        </label>
+        <label>
+          <span>Mệnh giá xu</span>
+          <select value={chipValue} onChange={event => setChipValue(event.target.value)}>
+            {[2, 10, 50, 100, 1000].map(value => <option value={value} key={value}>{value} xu</option>)}
+          </select>
+        </label>
+        <label>
+          <span>Số lần cộng mệnh giá vào mỗi cửa</span>
+          <input type="number" min="1" max="5" step="1" value={tapsPerItem} onChange={event => setTapsPerItem(event.target.value)} />
+          <small>{chipValue} xu × {tapsPerItem || 0} = {(Number(chipValue) * Number(tapsPerItem || 0)).toLocaleString('vi-VN')} xu cho mỗi cửa được chọn.</small>
+        </label>
+      </div>
+
+      <div className="autoplay-strategy-settings">
+        <div>
+          <strong>Cấu hình riêng: {activeStrategy?.name ?? strategy}</strong>
+          <small>Các giá trị này được lưu riêng cho chiến thuật đang chọn.</small>
+        </div>
+        <label><span>Xác suất Rau tối thiểu</span><input type="number" min="0" max="100" step="0.1" value={minimumVegetableProbability} onChange={event => setMinimumVegetableProbability(event.target.value)} /><small>%</small></label>
+        <label><span>Xác suất Thịt tối thiểu</span><input type="number" min="0" max="100" step="0.1" value={minimumMeatProbability} onChange={event => setMinimumMeatProbability(event.target.value)} /><small>%</small></label>
+        <label><span>Số cửa tối đa</span><input type="number" min="1" max="3" step="1" value={maximumSelections} onChange={event => setMaximumSelections(event.target.value)} /></label>
+        <label><span>Dừng sau chuỗi thua</span><input type="number" min="0" max="20" step="1" value={maxConsecutiveLosses} onChange={event => setMaxConsecutiveLosses(event.target.value)} /><small>Đặt 0 để tắt giới hạn này; giới hạn lỗ ngày vẫn hoạt động.</small></label>
+        <label className="autoplay-recovery-toggle"><span>Gỡ lỗ có giới hạn</span><input type="checkbox" checked={lossRecoveryEnabled} onChange={event => setLossRecoveryEnabled(event.target.checked)} /><small>Chỉ tăng tiền khi cầu tiếp theo vẫn vượt toàn bộ bộ lọc xác suất.</small></label>
+        <label><span>Hệ số tăng sau mỗi lần thua</span><input type="number" min="1" max="3" step="0.1" value={lossRecoveryMultiplier} onChange={event => setLossRecoveryMultiplier(event.target.value)} disabled={!lossRecoveryEnabled} /><small>Ví dụ x2: 1 → 2 → 4 lần cộng mệnh giá.</small></label>
+        <label><span>Số bước gỡ tối đa</span><input type="number" min="0" max="5" step="1" value={maximumRecoverySteps} onChange={event => setMaximumRecoverySteps(event.target.value)} disabled={!lossRecoveryEnabled} /><small>Chạm trần vốn hoặc số lần chạm thì tool bỏ cầu.</small></label>
+      </div>
+
+      {mode === 'LIVE' && (
+        <label className="autoplay-live-ack">
+          <input type="checkbox" checked={liveAcknowledged} onChange={event => setLiveAcknowledged(event.target.checked)} />
+          <span>Tôi xác nhận tọa độ cửa và mệnh giá xu trên điện thoại đã được kiểm tra; LIVE có thể làm thay đổi số dư thật.</span>
+        </label>
+      )}
+
+      {activeStrategy && (
+        <div className="autoplay-guardrails">
+          <span>Tin cậy ≥ {activeStrategy.minimumConfidencePercent}%</span>
+          <span>Khoảng cách top ≥ {activeStrategy.minimumTopGapPercent}%</span>
+          <span>Lợi thế kỳ vọng ≥ {activeStrategy.minimumExpectedEdgePercent}%</span>
+          <span>Cửa tối đa x{activeStrategy.maximumPayoutMultiplier}</span>
+          <span>Lỗ ngày tối đa {activeStrategy.maxDailyLossPercent}%</span>
+          <span>Rau ≥ {minimumVegetableProbability}% · Thịt ≥ {minimumMeatProbability}%</span>
+          <span>Tối đa {maximumSelections} cửa · {Number(maxConsecutiveLosses) === 0 ? 'không dừng theo chuỗi thua' : `dừng sau ${maxConsecutiveLosses} lần thua`}</span>
+          <span>{lossRecoveryEnabled ? `Gỡ lỗ x${lossRecoveryMultiplier}, tối đa ${maximumRecoverySteps} bước` : 'Gỡ lỗ đang tắt'}</span>
+        </div>
+      )}
+
+      <div className="autoplay-save-row">
+        <button type="button" onClick={() => void save()} disabled={saving || !status}>
+          {saving ? 'Đang lưu…' : `Lưu cấu hình (${enabled ? 'bật' : 'tắt'})`}
+        </button>
+        {message && <span>{message}</span>}
+      </div>
+
+      <div className="autoplay-history">
+        <div className="panel-heading"><div><p className="panel-kicker">PHIÊN TỰ ĐỘNG</p><h3>Vốn và lời/lỗ theo từng lần bật</h3></div></div>
+        <div className="autoplay-run-list">
+          {status?.recentRuns.map(run => (
+            <div className={`autoplay-run ${run.status.toLowerCase()}`} key={run.id}>
+              <strong>{run.status} · {run.mode}</strong>
+              <span>{new Date(run.startedAtUtc).toLocaleString('vi-VN')}</span>
+              <span>Vốn {run.startingBalanceUnits.toLocaleString('vi-VN')} → {run.currentBalanceUnits.toLocaleString('vi-VN')}</span>
+              <span className={run.netUnits < 0 ? 'negative' : 'positive'}>Lãi/lỗ cược thuần {run.netUnits > 0 ? '+' : ''}{run.netUnits}</span>
+              {run.mode === 'LIVE' && run.endingBalanceUnits !== null && (() => {
+                const actualDelta = run.endingBalanceUnits - run.startingBalanceUnits
+                return <small>Biến động vốn thực tế {actualDelta > 0 ? '+' : ''}{actualDelta} xu; phần chênh có thể gồm thưởng hoặc phí ngoài cược.</small>
+              })()}
+              <small>{run.betRounds} cầu đặt · {run.skippedRounds} bỏ · {run.wonRounds} thắng · {run.lostRounds} thua · {run.highRiskSkippedRounds} bỏ rủi ro cao</small>
+              {(run.participationDiamonds ?? 0) > 0 && <small>Mức phí đã bấm xác nhận: {run.participationDiamonds} kim cương</small>}
+            </div>
+          ))}
+        </div>
+        <div className="panel-heading"><div><p className="panel-kicker">NHẬT KÝ QUYẾT ĐỊNH</p><h3>50 round gần nhất · bấm để xem chi tiết</h3></div></div>
+        <div className="autoplay-history-list">
+          {status?.recentActions.map(action => (
+            <details className={`autoplay-action ${action.status.toLowerCase()}`} key={action.id}>
+              <summary>
+                <span><strong>#{action.roundNumber} · {action.bets.length ? `${action.bets.length} cửa` : 'Bỏ cầu'}</strong><small>{action.mode} · cược {action.totalStakeUnits} xu · rủi ro {action.riskLevel}{action.recoveryStep > 0 ? ` · gỡ bước ${action.recoveryStep} (x${action.stakeMultiplier})` : ''}</small></span>
+                <span><strong>{action.status}</strong><small>KQ {action.resultItemCode ?? 'chưa có'} · lãi/lỗ {action.netUnits ?? '—'}</small></span>
+              </summary>
+              <p>{action.reason}</p>
+              {(action.participationDiamonds ?? 0) > 0 && <p>Đã chạm xác nhận phí tham gia {action.participationDiamonds} kim cương · {action.participationStatus}</p>}
+              {action.bets.map(bet => <div className="autoplay-bet-detail" key={bet.itemCode}>
+                <strong>{bet.itemName}</strong><span>{bet.stakeUnits} xu · {bet.tapCount} chạm · p {bet.probabilityPercent.toFixed(1)}% · x{bet.payoutMultiplier} · edge {bet.expectedEdgePercent.toFixed(1)}%</span>
+              </div>)}
+              <div className="autoplay-verification">
+                <strong>Xác minh: {action.verification.status}</strong>
+                <span>Số dư {action.verification.balanceBeforeUnits ?? '—'} → {action.verification.balanceAfterUnits ?? '—'} · dự kiến trừ {action.verification.expectedDebitUnits}</span>
+                <small>{action.verification.message}</small>
+              </div>
+            </details>
+          ))}
+          {status?.recentActions.length === 0 && <p className="muted">Chưa có quyết định. Bật mô phỏng để quan sát trước khi cân nhắc LIVE.</p>}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function toPhonePoint(event: React.PointerEvent<HTMLImageElement>, element: HTMLImageElement) {
+  const rect = element.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return null
+  return {
+    x: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)),
+    y: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)),
+  }
+}
+
+function PhonePreviewPanel({
+  status,
+  adminSession,
+}: {
+  status: ScannerStatus | null
+  adminSession: AdminSession | null
+}) {
+  const [controlStatus, setControlStatus] = useState<PhoneControlStatus | null>(null)
+  const [imageUrl, setImageUrl] = useState<string | null>(null)
+  const [live, setLive] = useState(true)
+  const [previewEnabled, setPreviewEnabled] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [connecting, setConnecting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [lastAction, setLastAction] = useState<string | null>(null)
+  const imageUrlRef = useRef<string | null>(null)
+  const pointerRef = useRef<PhonePointerState | null>(null)
+  const captureInFlightRef = useRef(false)
+  const canControl = adminSession?.isAuthenticated === true
+
+  const clearFrame = useCallback(() => {
+    const previousUrl = imageUrlRef.current
+    imageUrlRef.current = null
+    setImageUrl(null)
+    if (previousUrl) URL.revokeObjectURL(previousUrl)
+  }, [])
+
+  const refreshStatus = useCallback(async () => {
+    if (!canControl) return
+    try {
+      const next = await api.phoneControlStatus()
+      setControlStatus(next)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Khong doc duoc trang thai dien thoai')
+    }
+  }, [canControl])
+
+  const refreshFrame = useCallback(async () => {
+    if (!canControl || captureInFlightRef.current) return
+    captureInFlightRef.current = true
+    try {
+      const blob = await api.phoneScreenshot()
+      const nextUrl = URL.createObjectURL(blob)
+      const previousUrl = imageUrlRef.current
+      imageUrlRef.current = nextUrl
+      setImageUrl(nextUrl)
+      setError(null)
+      if (previousUrl) {
+        window.setTimeout(() => URL.revokeObjectURL(previousUrl), 500)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Khong chup duoc man hinh dien thoai')
+    } finally {
+      captureInFlightRef.current = false
+    }
+  }, [canControl])
+
+  useEffect(() => () => {
+    if (imageUrlRef.current) URL.revokeObjectURL(imageUrlRef.current)
+  }, [])
+
+  useEffect(() => {
+    if (!canControl) {
+      setControlStatus(null)
+      setPreviewEnabled(false)
+      clearFrame()
+      return
+    }
+    if (!previewEnabled) return
+    const timer = window.setInterval(() => void refreshStatus(), 5000)
+    return () => window.clearInterval(timer)
+  }, [canControl, clearFrame, previewEnabled, refreshStatus])
+
+  useEffect(() => {
+    if (!canControl || !previewEnabled || !live) return
+    void refreshFrame()
+    const timer = window.setInterval(() => void refreshFrame(), expanded ? 700 : 1100)
+    return () => window.clearInterval(timer)
+  }, [canControl, expanded, live, previewEnabled, refreshFrame])
+
+  const connectPhone = useCallback(async () => {
+    if (!canControl || connecting) return
+    setConnecting(true)
+    setError(null)
+    try {
+      const next = await api.phoneControlStatus()
+      setControlStatus(next)
+      setLastAction(next.connected ? 'Da ket noi dien thoai' : 'Chua ket noi duoc dien thoai')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Khong ket noi duoc dien thoai')
+    } finally {
+      setConnecting(false)
+    }
+  }, [canControl, connecting])
+
+  const stopPreview = useCallback(async () => {
+    setPreviewEnabled(false)
+    setLive(false)
+    setExpanded(false)
+    clearFrame()
+    try {
+      await api.phonePreviewStop()
+      setLastAction('Da tat preview de giam tai nguyen')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Khong tat duoc preview')
+    }
+  }, [clearFrame])
+
+  const togglePreview = useCallback(async () => {
+    if (!canControl || busy || connecting) return
+    if (previewEnabled) {
+      await stopPreview()
+      return
+    }
+    setConnecting(true)
+    setError(null)
+    try {
+      const next = await api.phoneControlStatus()
+      setControlStatus(next)
+      if (!next.connected) {
+        setLastAction('Chua ket noi duoc dien thoai')
+        return
+      }
+      setPreviewEnabled(true)
+      setLive(true)
+      setLastAction('Da bat preview dien thoai')
+      await refreshFrame()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Khong bat duoc preview')
+    } finally {
+      setConnecting(false)
+    }
+  }, [busy, canControl, connecting, previewEnabled, refreshFrame, stopPreview])
+
+  const runAction = useCallback(async (label: string, action: () => Promise<void>) => {
+    if (!canControl || busy) return
+    setBusy(true)
+    try {
+      await action()
+      setLastAction(label)
+      if (previewEnabled && !live) await refreshFrame()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Khong gui duoc lenh toi dien thoai')
+    } finally {
+      setBusy(false)
+    }
+  }, [busy, canControl, live, previewEnabled, refreshFrame])
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLImageElement>) => {
+    if (!canControl || !previewEnabled || busy) return
+    const point = toPhonePoint(event, event.currentTarget)
+    if (!point) return
+    pointerRef.current = {
+      pointerId: event.pointerId,
+      startX: point.x,
+      startY: point.y,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      startedAt: Date.now(),
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    event.preventDefault()
+  }
+
+  const handlePointerUp = (event: React.PointerEvent<HTMLImageElement>) => {
+    const pointer = pointerRef.current
+    if (!pointer || pointer.pointerId !== event.pointerId) return
+    pointerRef.current = null
+    const point = toPhonePoint(event, event.currentTarget)
+    if (!point) return
+    const movedPixels = Math.hypot(event.clientX - pointer.clientX, event.clientY - pointer.clientY)
+    const durationMs = Math.max(80, Date.now() - pointer.startedAt)
+    if (movedPixels < 12 && durationMs < 450) {
+      void runAction(`Tap ${Math.round(point.x * 100)}% / ${Math.round(point.y * 100)}%`, () =>
+        api.phoneTap(point.x, point.y))
+    } else {
+      void runAction('Swipe tren dien thoai', () =>
+        api.phoneSwipe(pointer.startX, pointer.startY, point.x, point.y, durationMs))
+    }
+    event.preventDefault()
+  }
+
+  const phoneSize = controlStatus?.width && controlStatus?.height
+    ? `${controlStatus.width} x ${controlStatus.height}`
+    : 'Dang doc do phan giai'
+  const connected = controlStatus?.connected === true
+
+  return (
+    <section className={`phone-preview-panel ${expanded ? 'expanded' : ''}`}>
+      <div className="phone-preview-heading">
+        <div>
+          <p className="panel-kicker">DIEN THOAI THAT</p>
+          <h2>Preview full man hinh va thao tac truc tiep</h2>
+          <p>
+            {canControl
+              ? `${controlStatus?.model ?? controlStatus?.serial ?? 'ADB'} · ${phoneSize}`
+              : 'Dang nhap admin de xem va dieu khien dien thoai qua web.'}
+          </p>
+        </div>
+        <div className="phone-preview-actions">
+          <span className={`phone-connection-pill ${connected ? 'online' : 'offline'}`}>
+            {connected ? 'Da ket noi' : 'Chua ket noi'}
+          </span>
+          <button type="button" onClick={() => void connectPhone()} disabled={!canControl || connecting}>
+            {connecting ? 'Dang ket noi' : 'Ket noi dien thoai'}
+          </button>
+          <button type="button" onClick={() => void togglePreview()} disabled={!canControl || busy || connecting}>
+            {previewEnabled ? 'Tat preview' : 'Bat preview'}
+          </button>
+          <button type="button" onClick={() => setLive(value => !value)} disabled={!canControl || !previewEnabled}>
+            {live ? 'Tam dung' : 'Chay live'}
+          </button>
+          <button type="button" onClick={() => void refreshFrame()} disabled={!canControl || !previewEnabled || busy}>
+            Lam moi anh
+          </button>
+          <button type="button" onClick={() => setExpanded(value => !value)} disabled={!previewEnabled}>
+            {expanded ? 'Thu nho' : 'Full man hinh'}
+          </button>
+        </div>
+      </div>
+
+      <div className="phone-preview-layout">
+        <div className="phone-screen-shell">
+          {imageUrl && canControl && previewEnabled ? (
+            <img
+              src={imageUrl}
+              alt="Man hinh dien thoai"
+              draggable={false}
+              onPointerDown={handlePointerDown}
+              onPointerUp={handlePointerUp}
+              onPointerCancel={() => { pointerRef.current = null }}
+            />
+          ) : (
+            <div className="phone-screen-placeholder">
+              <strong>{canControl ? (previewEnabled ? 'Dang lay anh tu ADB' : 'Preview dang tat') : 'Can dang nhap admin'}</strong>
+              <span>{canControl ? 'Bam Ket noi dien thoai de kiem tra ADB, roi bam Bat preview khi can thao tac.' : 'Chuc nang nay chi danh cho admin.'}</span>
+            </div>
+          )}
+        </div>
+
+        <div className="phone-control-side">
+          <div className="phone-control-card">
+            <small>Trang thai scanner</small>
+            <strong>{status?.isOnline ? 'Dang scan' : 'Ngoai tuyen'}</strong>
+            <span>Round {status?.activeRound ?? status?.currentRound ?? '—'} · {status?.countdownSeconds ?? '--'}s</span>
+          </div>
+          <div className="phone-control-buttons">
+            <button type="button" disabled={!canControl || !connected || busy} onClick={() => void runAction('Back', () => api.phoneKey(4))}>Back</button>
+            <button type="button" disabled={!canControl || !connected || busy} onClick={() => void runAction('Home', () => api.phoneKey(3))}>Home</button>
+            <button type="button" disabled={!canControl || !connected || busy} onClick={() => void runAction('Recent', () => api.phoneKey(187))}>Recent</button>
+          </div>
+          <p className="phone-preview-note">
+            Preview mac dinh se tat de tiet kiem tai nguyen. Khi can tu danh, bam Bat preview roi cham vao anh de tap hoac keo de swipe.
+          </p>
+          {(error || controlStatus?.message || lastAction) && (
+            <p className={`phone-preview-status ${error ? 'error' : connected ? 'online' : 'offline'}`}>
+              {error ?? lastAction ?? controlStatus?.message}
+            </p>
+          )}
+        </div>
+      </div>
     </section>
   )
 }
@@ -601,6 +1225,145 @@ function PredictionResult({ prediction }: { prediction: Prediction }) {
   )
 }
 
+function MarketPredictionPanel({
+  response,
+  loading,
+  error,
+  onRefresh,
+}: {
+  response: MarketPredictionResponse | null
+  loading: boolean
+  error: string | null
+  onRefresh: () => void
+}) {
+  const house = response?.housePerformance
+  const side = response?.sideForecast
+  const hotMeta = response?.hotItemCode ? ITEM_META[response.hotItemCode] : null
+  const liabilityMeta = house?.highestCurrentLiabilityItemCode
+    ? ITEM_META[house.highestCurrentLiabilityItemCode]
+    : null
+  const hotOutcomeLeaders = response?.hotOutcomeStats
+    ?.filter(item => item.outcomeRounds > 0)
+    .slice(0, 3) ?? []
+  const ready = response?.status === 'READY' && response.prediction
+  const statusLabel = response?.status === 'READY'
+    ? 'Đã chốt dự đoán'
+    : response?.status === 'COLLECTING_COINS'
+      ? 'Đang gom xu'
+      : response?.status === 'WAITING_HOT'
+        ? 'Đang chờ HOT'
+        : response?.status === 'WAITING_SIGNAL'
+          ? 'Nền sẵn · chờ tối đa 10s'
+        : 'Đang quan sát'
+  return (
+    <section className={`panel prediction-panel market-prediction-panel ${loading ? 'is-loading' : ''} ${ready ? 'ready' : 'waiting'}`}>
+      <div className="panel-heading">
+        <div>
+          <p className="panel-kicker market-kicker">MÔ HÌNH MỚI · 500 CẦU GẦN NHẤT</p>
+          <h2>Dự đoán theo HOT, lượng xu, cầu Đỏ/Xanh và lợi thế kỳ vọng</h2>
+        </div>
+        <div className="ai-prediction-actions">
+          <div className="market-live-state">
+            <span className={`market-status ${ready ? 'ready' : 'waiting'}`}>{statusLabel}</span>
+            <strong>{response?.countdownSeconds != null ? `${response.countdownSeconds}s` : '--s'}</strong>
+          </div>
+          <button type="button" onClick={onRefresh} disabled={loading}>{loading ? 'Đang tính...' : 'Cập nhật ngay'}</button>
+        </div>
+      </div>
+
+      <div className="market-observation-strip" aria-live="polite">
+        <div><span>Round đang phân tích</span><strong>{response?.roundNumber ?? '—'}</strong></div>
+        <div><span>HOT (nếu có)</span><strong>{hotMeta ? `${hotMeta.icon} ${hotMeta.name}` : 'Không có / chưa báo'}</strong></div>
+        <div><span>Cầu ghép HOT/xu</span><strong>{response?.matchedSignalRounds ?? 0}/{response?.analysisWindow ?? 500}</strong></div>
+        <div><span>Bộ xử lý / thời gian</span><strong>{response ? `${response.computeDevice} · ${response.analysisDurationMs}ms` : 'CPU · --ms'}</strong></div>
+        <p>{response?.message ?? 'Đang tính sẵn nền 500 cầu. HOT/xu là tín hiệu bổ sung; thiếu tín hiệu vẫn tự chốt sau 10 giây đầu.'}</p>
+      </div>
+
+      <div className="market-side-map" aria-label="Phân nhóm hai bên Đỏ và Xanh">
+        <article className="red">
+          <span>BÊN ĐỎ</span>
+          <strong>🍅 Cà chua · 🌭 Bánh mì · 🥕 Cà rốt · 🥩 Bò</strong>
+        </article>
+        <article className="green">
+          <span>BÊN XANH</span>
+          <strong>🌽 Ngô · 🥬 Cải · 🍢 Xiên · 🍗 Đùi</strong>
+        </article>
+      </div>
+
+      {side && (
+        <div className="market-side-forecast">
+          <article className="red">
+            <span>Khả năng bên Đỏ</span>
+            <strong>{side.redProbabilityPercent.toFixed(2)}%</strong>
+            <div><i style={{ width: `${side.redProbabilityPercent}%` }} /></div>
+          </article>
+          <article className="green">
+            <span>Khả năng bên Xanh</span>
+            <strong>{side.greenProbabilityPercent.toFixed(2)}%</strong>
+            <div><i style={{ width: `${side.greenProbabilityPercent}%` }} /></div>
+          </article>
+          <p>
+            Nhịp hiện tại: <b>{side.currentSide === 'RED' ? 'Đỏ' : side.currentSide === 'GREEN' ? 'Xanh' : 'chưa đủ dữ liệu'}</b>
+            {side.currentSide && ` ${side.currentStreak} cầu`} · khớp {side.matchedTransitions} chuyển tiếp tương tự · trọng số cầu màu {side.signalWeightPercent.toFixed(1)}%
+          </p>
+        </div>
+      )}
+
+      {house && (
+        <div className="house-performance-grid">
+          <article><span>Kết quả đã định giá</span><strong>{house.analyzedRounds}</strong><small>cầu có đủ xu + kết quả</small></article>
+          <article className={house.estimatedNetUnits >= 0 ? 'positive' : 'negative'}><span>Nhà cái ước tính</span><strong>{house.estimatedNetUnits >= 0 ? '+' : ''}{house.estimatedNetUnits.toFixed(1)} xu</strong><small>biên {house.estimatedMarginPercent.toFixed(1)}% · không phải tiền thật</small></article>
+          <article><span>HOT về đúng cửa</span><strong>{house.hotHitRatePercent.toFixed(1)}%</strong><small>trên {house.hotObservedRounds} cầu có HOT</small></article>
+          <article><span>Dấu hiệu né nghĩa vụ</span><strong>{house.riskAvoidanceScorePercent.toFixed(1)}%</strong><small>50% ≈ chưa thấy thiên lệch rõ</small></article>
+          <article><span>Cửa nhà cái ngại nhất</span><strong>{liabilityMeta ? `${liabilityMeta.icon} ${liabilityMeta.name}` : 'Chưa đủ xu'}</strong><small>nghĩa vụ tương đối {house.highestCurrentLiabilityUnits.toFixed(1)}</small></article>
+        </div>
+      )}
+
+      {(hotOutcomeLeaders.length > 0 || (house?.currentOutcomeScenarios?.length ?? 0) > 0) && (
+        <div className="market-evidence-grid">
+          <article>
+            <span>LOG HOT → KẾT QUẢ</span>
+            <strong>{hotMeta ? `${hotMeta.icon} HOT ${hotMeta.name}` : 'Chưa có HOT'}</strong>
+            {hotOutcomeLeaders.length > 0 ? hotOutcomeLeaders.map(stat => {
+              const outcome = ITEM_META[stat.outcomeItemCode]
+              return <small key={stat.outcomeItemCode}>→ {outcome?.icon} {outcome?.name}: {stat.outcomeRounds}/{stat.hotObservedRounds} cầu ({stat.outcomeRatePercent.toFixed(1)}%)</small>
+            }) : <small>Đang chờ đủ round HOT có kết quả để học quan hệ chuyển tiếp.</small>}
+          </article>
+          <article>
+            <span>KỊCH BẢN NHÀ CÁI THEO MỨC XU HIỆN TẠI</span>
+            <strong>Tổng mức vào tương đối: {house?.currentEstimatedStakeUnits.toFixed(1) ?? '0.0'}</strong>
+            {house?.currentOutcomeScenarios.map(scenario => {
+              const item = ITEM_META[scenario.itemCode]
+              const net = scenario.estimatedHouseNetUnits
+              return <small className={net >= 0 ? 'positive' : 'negative'} key={scenario.itemCode}>Nếu về {item?.icon} {item?.name}: nhà cái {net >= 0 ? 'lãi' : 'lỗ'} {Math.abs(net).toFixed(1)} đơn vị (mức xu {scenario.coinLevel}/3)</small>
+            })}
+          </article>
+        </div>
+      )}
+
+      {ready ? (
+        <div className="market-prediction-result">
+          <PredictionResult prediction={response.prediction!} />
+          <div className="market-side-item-note">
+            {response.prediction!.items.map(item => (
+              <span className={RED_SIDE_CODES.has(item.itemCode) ? 'red' : 'green'} key={item.itemCode}>
+                {ITEM_META[item.itemCode]?.icon} {item.itemName}: {RED_SIDE_CODES.has(item.itemCode) ? 'Đỏ' : 'Xanh'}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="market-waiting-card">
+          <span className="market-radar" aria-hidden="true"><i /></span>
+          <div><strong>Đã chuẩn bị nền 500 cầu</strong><p>HOT/xu có thì dùng ngay. Nếu không có, hệ thống tự chốt khi hết 10 giây đầu của round.</p></div>
+        </div>
+      )}
+      {error && !loading && <div className="prediction-inline-error">{error}</div>}
+      {loading && <PredictionLoading tone="ai" label="Đang chốt từ nền 500 cầu và tín hiệu hiện có" />}
+    </section>
+  )
+}
+
 function PredictionLoading({ label, tone = 'local' }: {
   label: string
   tone?: 'local' | 'ai' | 'compound'
@@ -619,6 +1382,8 @@ async function keepLoadingVisible(startedAt: number, minimumMilliseconds = 700) 
 }
 
 function App() {
+  const [activeView, setActiveView] = useState<'report' | 'admin'>(() =>
+    window.sessionStorage.getItem('greedy-active-view') === 'admin' ? 'admin' : 'report')
   const [selectedDate, setSelectedDate] = useState(bangkokToday)
   const [stats, setStats] = useState<DailyStats | null>(null)
   const [days, setDays] = useState<DailySummary[]>([])
@@ -626,10 +1391,23 @@ function App() {
   const [results, setResults] = useState<Page<ResultItem>>(emptyPage)
   const [latestResults, setLatestResults] = useState<ResultItem[]>([])
   const [events, setEvents] = useState<ScannerEvent[]>([])
-  const [alerts, setAlerts] = useState<AlertDelivery[]>([])
+  const [visitors, setVisitors] = useState<Visitor[]>([])
+  const [accessKeys, setAccessKeys] = useState<AccessKey[]>([])
+  const [createdAccessKey, setCreatedAccessKey] = useState<CreatedAccessKey | null>(null)
+  const [newKeyLabel, setNewKeyLabel] = useState('')
+  const [newKeyDays, setNewKeyDays] = useState('30')
+  const [keyAdminMessage, setKeyAdminMessage] = useState<string | null>(null)
+  const [keyAdminSaving, setKeyAdminSaving] = useState(false)
+  const [alertWebhookConfig, setAlertWebhookConfig] = useState<AlertWebhookConfig | null>(null)
+  const [webhookUrlDraft, setWebhookUrlDraft] = useState('')
+  const [webhookSaving, setWebhookSaving] = useState(false)
+  const [webhookMessage, setWebhookMessage] = useState<string | null>(null)
   const [prediction, setPrediction] = useState<Prediction | null>(null)
   const [predictionLoading, setPredictionLoading] = useState(false)
   const [predictionError, setPredictionError] = useState<string | null>(null)
+  const [marketPredictionResponse, setMarketPredictionResponse] = useState<MarketPredictionResponse | null>(null)
+  const [marketPredictionLoading, setMarketPredictionLoading] = useState(false)
+  const [marketPredictionError, setMarketPredictionError] = useState<string | null>(null)
   const [aiPredictionResponse, setAiPredictionResponse] = useState<AiPredictionResponse | null>(null)
   const [aiPredictionLoading, setAiPredictionLoading] = useState(false)
   const [aiPredictionError, setAiPredictionError] = useState<string | null>(null)
@@ -656,12 +1434,21 @@ function App() {
   const [subscriberMessage, setSubscriberMessage] = useState<string | null>(null)
   const [savingSubscriber, setSavingSubscriber] = useState(false)
   const [adminSession, setAdminSession] = useState<AdminSession | null>(null)
+  const [accessSession, setAccessSession] = useState<AccessSession | null>(null)
+  const [rememberAccessKey, setRememberAccessKey] = useState(() => window.localStorage.getItem('greedy-remember-key') !== '0')
+  const [accessKeyInput, setAccessKeyInput] = useState('')
+  const [accessKeyError, setAccessKeyError] = useState<string | null>(null)
+  const [accessKeyLoading, setAccessKeyLoading] = useState(false)
   const [adminLoginOpen, setAdminLoginOpen] = useState(false)
-  const [adminUsername, setAdminUsername] = useState('admin')
+  const [rememberAdmin, setRememberAdmin] = useState(() => window.localStorage.getItem('greedy-remember-admin') !== '0')
+  const [adminUsername, setAdminUsername] = useState(() => window.localStorage.getItem('greedy-admin-username') ?? '1')
   const [adminPassword, setAdminPassword] = useState('')
   const [adminAuthError, setAdminAuthError] = useState<string | null>(null)
   const [adminAuthLoading, setAdminAuthLoading] = useState(false)
+  const [selectedVisitor, setSelectedVisitor] = useState<Visitor | null>(null)
   const predictionRequestId = useRef(0)
+  const marketPredictionRequestId = useRef(0)
+  const marketPredictionInFlight = useRef(false)
   const aiPredictionRequestId = useRef(0)
   const compoundPredictionRequestId = useRef(0)
   const statsRequestId = useRef(0)
@@ -757,19 +1544,30 @@ function App() {
   const refreshAdminData = useCallback(async () => {
     if (!adminSession?.isAuthenticated) {
       setEvents(current => current.length === 0 ? current : [])
-      setAlerts(current => current.length === 0 ? current : [])
+      setVisitors(current => current.length === 0 ? current : [])
+      setAccessKeys(current => current.length === 0 ? current : [])
+      setAlertWebhookConfig(null)
+      setWebhookUrlDraft('')
       return
     }
     try {
-      const [nextEvents, nextAlerts] = await Promise.all([api.events(), api.alerts()])
+      const [nextEvents, nextWebhookConfig, nextVisitors, nextAccessKeys] = await Promise.all([
+        api.events(), api.alertWebhookConfig(), api.visitors(), api.accessKeys(),
+      ])
       setEvents(current => sameJsonValue(current, nextEvents.items))
-      setAlerts(current => sameJsonValue(current, nextAlerts))
+      setVisitors(current => sameJsonValue(current, nextVisitors))
+      setAccessKeys(current => sameJsonValue(current, nextAccessKeys))
+      setAlertWebhookConfig(current => sameJsonValue(current, nextWebhookConfig))
+      setWebhookUrlDraft(current => current || nextWebhookConfig.webhookUrl || '')
     } catch {
       const nextSession = await api.adminSession()
       setAdminSession(nextSession)
       if (!nextSession.isAuthenticated) {
         setEvents([])
-        setAlerts([])
+        setVisitors([])
+        setAccessKeys([])
+        setAlertWebhookConfig(null)
+        setWebhookUrlDraft('')
       }
     }
   }, [adminSession?.isAuthenticated])
@@ -789,6 +1587,45 @@ function App() {
     } finally {
       await keepLoadingVisible(startedAt)
       if (requestId === predictionRequestId.current) setPredictionLoading(false)
+    }
+  }, [selectedDate])
+
+  const refreshMarketPrediction = useCallback(async (showLoading = true) => {
+    // Coalesce frequent polling calls. Overlapping requests used to keep
+    // invalidating each other, so a response taking >1 second could never be
+    // committed and the loading overlay remained visible indefinitely.
+    if (marketPredictionInFlight.current) return
+    marketPredictionInFlight.current = true
+    const requestId = ++marketPredictionRequestId.current
+    const startedAt = Date.now()
+    if (showLoading) setMarketPredictionLoading(true)
+    try {
+      const response = await api.marketPrediction(selectedDate)
+      if (requestId === marketPredictionRequestId.current) {
+        setMarketPredictionResponse(current => {
+          // Keep a completed prediction visible through the 0-second lock
+          // state. It is cleared naturally when the scanner reports a new
+          // round, so a late HOT detection cannot flash for only one poll.
+          if (current?.status === 'READY' &&
+              response.status !== 'READY' &&
+              current.roundNumber === response.roundNumber) {
+            return current
+          }
+          return response
+        })
+        setMarketPredictionError(null)
+      }
+    } catch (caught) {
+      if (requestId === marketPredictionRequestId.current) {
+        const message = caught instanceof Error ? caught.message : 'Không thể tính dự đoán HOT và xu'
+        setMarketPredictionError(/^404(?:\s|$)/.test(message)
+          ? 'Backend chưa nạp API mô hình mới. Hãy khởi động lại toàn bộ hệ thống để đồng bộ backend và giao diện.'
+          : message)
+      }
+    } finally {
+      if (showLoading) await keepLoadingVisible(startedAt, 150)
+      if (showLoading && requestId === marketPredictionRequestId.current) setMarketPredictionLoading(false)
+      marketPredictionInFlight.current = false
     }
   }, [selectedDate])
 
@@ -833,24 +1670,60 @@ function App() {
   }, [selectedDate])
 
   useEffect(() => {
-    void api.adminSession()
-      .then(setAdminSession)
-      .catch(() => setAdminSession({ isAuthenticated: false, isConfigured: false, username: null }))
+    void Promise.all([api.adminSession(), api.accessSession()])
+      .then(([nextAdminSession, nextAccessSession]) => {
+        setAdminSession(nextAdminSession)
+        setAccessSession(nextAccessSession)
+      })
+      .catch(() => {
+        setAdminSession({ isAuthenticated: false, isConfigured: false, username: null })
+        setAccessSession({ isAuthorized: false, accessType: null, keyLabel: null, keyExpiresAtUtc: null, keyExpired: false, deviceLeaseSeconds: 90 })
+      })
   }, [])
 
   useEffect(() => {
+    if (adminSession && !adminSession.isAuthenticated && activeView === 'admin') {
+      setActiveView('report')
+      window.sessionStorage.setItem('greedy-active-view', 'report')
+    }
+  }, [activeView, adminSession])
+
+  useEffect(() => {
+    function denyAccess(event: Event) {
+      const code = (event as CustomEvent<{ code?: string }>).detail?.code
+      setAccessSession(current => ({
+        isAuthorized: false,
+        accessType: null,
+        keyLabel: null,
+        keyExpiresAtUtc: null,
+        keyExpired: code === 'ACCESS_KEY_EXPIRED',
+        deviceLeaseSeconds: current?.deviceLeaseSeconds ?? 90,
+      }))
+      setStats(null)
+      setResults(emptyPage)
+      setLatestResults([])
+      setStatus(null)
+    }
+    window.addEventListener('greedy-access-denied', denyAccess)
+    return () => window.removeEventListener('greedy-access-denied', denyAccess)
+  }, [])
+
+  useEffect(() => {
+    if (!accessSession?.isAuthorized) return
     void refreshStats()
-  }, [refreshStats])
+  }, [accessSession?.isAuthorized, refreshStats])
 
   useEffect(() => {
+    if (!accessSession?.isAuthorized) return
     void refreshResults()
-  }, [refreshResults])
+  }, [accessSession?.isAuthorized, refreshResults])
 
   useEffect(() => {
+    if (!accessSession?.isAuthorized) return
     void refreshSecondary()
     const timer = window.setInterval(() => void refreshSecondary(), 10000)
     return () => window.clearInterval(timer)
-  }, [refreshSecondary])
+  }, [accessSession?.isAuthorized, refreshSecondary])
 
   useEffect(() => {
     void refreshAdminData()
@@ -860,6 +1733,7 @@ function App() {
   }, [adminSession?.isAuthenticated, refreshAdminData])
 
   useEffect(() => {
+    if (!accessSession?.isAuthorized) return
     let stopped = false
     let timer: number | undefined
     let polling = false
@@ -960,7 +1834,7 @@ function App() {
       if (timer !== undefined) window.clearTimeout(timer)
       document.removeEventListener('visibilitychange', resumeWhenVisible)
     }
-  }, [adminSession?.isAuthenticated, refreshResults, refreshSecondary, refreshStats, selectedDate, showResultAnnouncement])
+  }, [accessSession?.isAuthorized, adminSession?.isAuthenticated, refreshResults, refreshSecondary, refreshStats, selectedDate, showResultAnnouncement])
 
   useEffect(() => {
     const query = window.matchMedia('(max-width: 760px)')
@@ -1012,6 +1886,13 @@ function App() {
     void refreshPrediction()
   }, [latestResultId, refreshPrediction, selectedDate, statsDate])
 
+  useEffect(() => {
+    if (!accessSession?.isAuthorized || activeView !== 'report' || selectedDate !== bangkokToday()) return
+    void refreshMarketPrediction(marketPredictionResponse === null)
+    const timer = window.setInterval(() => void refreshMarketPrediction(false), 500)
+    return () => window.clearInterval(timer)
+  }, [accessSession?.isAuthorized, activeView, marketPredictionResponse === null, refreshMarketPrediction, selectedDate])
+
   const latestSequence = useMemo(
     () => latestResults.map(result => result.itemCode),
     [latestResults],
@@ -1028,11 +1909,30 @@ function App() {
     () => subscribers.filter(subscriber => subscriber.isActive),
     [subscribers],
   )
+  const currentVisitor = useMemo(
+    () => visitors.find(visitor => visitor.deviceId === getClientDeviceId()) ?? null,
+    [visitors],
+  )
+  const onlineVisitors = useMemo(
+    () => visitors.filter(visitor => visitor.isOnline),
+    [visitors],
+  )
   const streakConversationRuns = useMemo(
     () => [...(stats?.vegetableRuns ?? []), ...(stats?.meatRuns ?? [])]
       .sort((left, right) => Date.parse(right.endedAtUtc) - Date.parse(left.endedAtUtc)),
     [stats?.meatRuns, stats?.vegetableRuns],
   )
+
+  function switchView(view: 'report' | 'admin') {
+    if (view === 'admin' && !adminSession?.isAuthenticated) {
+      setAdminAuthError(null)
+      setAdminLoginOpen(true)
+      return
+    }
+    setActiveView(view)
+    window.sessionStorage.setItem('greedy-active-view', view)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
 
   function changeDate(value: string) {
     setSelectedDate(value)
@@ -1041,6 +1941,8 @@ function App() {
     if (resultsScrollRef.current) resultsScrollRef.current.scrollTop = 0
     setSelectedBucket(null)
     setStreakSummaryOpen(false)
+    setMarketPredictionResponse(null)
+    setMarketPredictionError(null)
     setAiPredictionResponse(null)
     setAiPredictionError(null)
     setCompoundPredictionResponse(null)
@@ -1120,15 +2022,124 @@ function App() {
     await refreshAdminData()
   }
 
+  async function saveWebhookConfig(enabled = alertWebhookConfig?.enabled ?? false) {
+    setWebhookSaving(true)
+    setWebhookMessage(null)
+    try {
+      const next = await api.saveAlertWebhookConfig(enabled, webhookUrlDraft.trim())
+      setAlertWebhookConfig(next)
+      setWebhookUrlDraft(next.webhookUrl)
+      setWebhookMessage(next.enabled ? 'Đã bật thông báo webhook.' : 'Đã tắt thông báo webhook.')
+    } catch (caught) {
+      setWebhookMessage(caught instanceof Error ? caught.message : 'Không lưu được cấu hình webhook')
+    } finally {
+      setWebhookSaving(false)
+    }
+  }
+
+  async function toggleWebhookConfig() {
+    const nextEnabled = !(alertWebhookConfig?.enabled ?? false)
+    await saveWebhookConfig(nextEnabled)
+  }
+
+  async function loginWithAccessKey(event: React.FormEvent) {
+    event.preventDefault()
+    setAccessKeyLoading(true)
+    setAccessKeyError(null)
+    try {
+      const normalizedKey = accessKeyInput.trim().toUpperCase()
+      const session = await api.accessLogin(normalizedKey, getClientDeviceId(), getClientDeviceName(), rememberAccessKey)
+      setAccessSession(session)
+      if (rememberAccessKey) {
+        window.localStorage.setItem('greedy-remember-key', '1')
+      } else {
+        window.localStorage.setItem('greedy-remember-key', '0')
+      }
+      setAccessKeyInput('')
+      setError(null)
+    } catch (caught) {
+      setAccessKeyError(caught instanceof Error ? caught.message : 'Không thể xác thực key')
+    } finally {
+      setAccessKeyLoading(false)
+    }
+  }
+
+  async function logoutAccessKey() {
+    await api.accessLogout()
+    setAccessSession({
+      isAuthorized: false,
+      accessType: null,
+      keyLabel: null,
+      keyExpiresAtUtc: null,
+      keyExpired: false,
+      deviceLeaseSeconds: accessSession?.deviceLeaseSeconds ?? 90,
+    })
+  }
+
+  async function createAccessKey(event: React.FormEvent) {
+    event.preventDefault()
+    const validDays = Number.parseInt(newKeyDays, 10)
+    if (!Number.isFinite(validDays) || validDays < 1 || validDays > 3650) {
+      setKeyAdminMessage('Số ngày phải từ 1 đến 3650.')
+      return
+    }
+    setKeyAdminSaving(true)
+    setKeyAdminMessage(null)
+    try {
+      const created = await api.createAccessKey(newKeyLabel.trim(), validDays)
+      setCreatedAccessKey(created)
+      setNewKeyLabel('')
+      setKeyAdminMessage('Đã tạo key. Hãy sao chép ngay vì backend không lưu key gốc.')
+      setAccessKeys(await api.accessKeys())
+    } catch (caught) {
+      setKeyAdminMessage(caught instanceof Error ? caught.message : 'Không tạo được key')
+    } finally {
+      setKeyAdminSaving(false)
+    }
+  }
+
+  async function toggleAccessKey(item: AccessKey) {
+    await api.setAccessKeyActive(item.id, !item.isActive)
+    setAccessKeys(await api.accessKeys())
+  }
+
+  async function disconnectAccessKey(id: number) {
+    await api.disconnectAccessKey(id)
+    setAccessKeys(await api.accessKeys())
+  }
+
+  async function deleteAccessKey(item: AccessKey) {
+    if (!window.confirm(`Xóa key của ${item.label}? Phiên đang dùng sẽ bị ngắt ngay.`)) return
+    await api.deleteAccessKey(item.id)
+    setAccessKeys(await api.accessKeys())
+    if (createdAccessKey?.id === item.id) setCreatedAccessKey(null)
+  }
+
+  async function copyCreatedAccessKey() {
+    if (!createdAccessKey) return
+    await navigator.clipboard.writeText(createdAccessKey.key)
+    setKeyAdminMessage('Đã sao chép key vào clipboard.')
+  }
+
   async function loginAdmin(event: React.FormEvent) {
     event.preventDefault()
     setAdminAuthLoading(true)
     setAdminAuthError(null)
     try {
-      const session = await api.adminLogin(adminUsername, adminPassword)
+      const session = await api.adminLogin(adminUsername, adminPassword, rememberAdmin)
       setAdminSession(session)
+      setAccessSession({ isAuthorized: true, accessType: 'admin', keyLabel: null, keyExpiresAtUtc: null, keyExpired: false, deviceLeaseSeconds: 90 })
+      if (rememberAdmin) {
+        window.localStorage.setItem('greedy-remember-admin', '1')
+        window.localStorage.setItem('greedy-admin-username', adminUsername.trim())
+      } else {
+        window.localStorage.setItem('greedy-remember-admin', '0')
+        window.localStorage.removeItem('greedy-admin-username')
+      }
       setAdminPassword('')
       setAdminLoginOpen(false)
+      setActiveView('admin')
+      window.sessionStorage.setItem('greedy-active-view', 'admin')
     } catch (caught) {
       setAdminAuthError(caught instanceof Error ? caught.message : 'Đăng nhập Admin thất bại')
     } finally {
@@ -1146,7 +2157,16 @@ function App() {
         username: null,
       }))
       setEvents([])
-      setAlerts([])
+      setAccessKeys([])
+      setVisitors([])
+      setSelectedVisitor(null)
+      setActiveView('report')
+      window.sessionStorage.setItem('greedy-active-view', 'report')
+      try {
+        setAccessSession(await api.accessSession())
+      } catch {
+        setAccessSession({ isAuthorized: false, accessType: null, keyLabel: null, keyExpiresAtUtc: null, keyExpired: false, deviceLeaseSeconds: 90 })
+      }
     }
   }
 
@@ -1180,6 +2200,40 @@ function App() {
     window.setTimeout(() => { openingDatePicker.current = false }, 0)
   }
 
+  if (!accessSession?.isAuthorized) {
+    return (
+      <div className="access-gate" role="dialog" aria-modal="true" aria-labelledby="access-gate-title">
+        <section className="access-gate-card">
+          <div className="access-gate-brand"><span>G</span><div><small>GREEDY BIGO</small><strong id="access-gate-title">Nhập key để tiếp tục</strong></div></div>
+          {accessSession === null ? (
+            <div className="access-gate-loading"><span className="prediction-spinner" /><p>Đang kiểm tra quyền truy cập...</p></div>
+          ) : (
+            <>
+              <p className="access-gate-description">Mỗi key chỉ dùng trên một thiết bị tại cùng một thời điểm. Nội dung chỉ được tải sau khi backend xác thực thành công.</p>
+              <form className="access-key-form" onSubmit={loginWithAccessKey}>
+                <label><span>Key truy cập</span><input value={accessKeyInput} onChange={event => setAccessKeyInput(event.target.value.toUpperCase())} placeholder="GRD-XXXXX-XXXXX-XXXXX-XXXXX" autoComplete="off" autoFocus required /></label>
+                <label className="remember-login"><input type="checkbox" checked={rememberAccessKey} onChange={event => setRememberAccessKey(event.target.checked)} /><span>Duy trì đăng nhập key trên thiết bị này</span></label>
+                {accessKeyError && <p className="admin-login-error">{accessKeyError}</p>}
+                {accessSession.keyExpired && !accessKeyError && <p className="admin-login-error">Key đã hết hạn. Vui lòng xin key mới từ quản trị viên.</p>}
+                <button className="access-key-submit" type="submit" disabled={accessKeyLoading}>{accessKeyLoading ? 'Đang xác thực...' : 'Mở trang thống kê'}</button>
+              </form>
+              <div className="access-gate-divider"><span>hoặc đăng nhập quản trị</span></div>
+              <form className="admin-login-form access-admin-form" onSubmit={loginAdmin}>
+                <div className="access-admin-inputs">
+                  <label><span>Tài khoản Admin</span><input autoComplete="username" value={adminUsername} onChange={event => setAdminUsername(event.target.value)} required /></label>
+                  <label><span>Mật khẩu</span><input type="password" autoComplete="current-password" value={adminPassword} onChange={event => setAdminPassword(event.target.value)} required /></label>
+                </div>
+                <label className="remember-login"><input type="checkbox" checked={rememberAdmin} onChange={event => setRememberAdmin(event.target.checked)} /><span>Duy trì đăng nhập Admin trong 30 ngày</span></label>
+                {adminAuthError && <p className="admin-login-error">{adminAuthError}</p>}
+                <button className="admin-login-submit" type="submit" disabled={adminAuthLoading || !adminSession?.isConfigured}>{adminAuthLoading ? 'Đang xác thực...' : 'Đăng nhập Admin'}</button>
+              </form>
+            </>
+          )}
+        </section>
+      </div>
+    )
+  }
+
   return (
     <div className="app-shell">
       {resultAnnouncement && (
@@ -1192,7 +2246,13 @@ function App() {
         <div>
           <h1>GREEDY BIGO · LIVE MONITOR</h1>
         </div>
-        <div className="topbar-actions">
+        <div className={`topbar-actions ${accessSession.accessType === 'key' ? 'has-key-session' : ''}`}>
+          {accessSession.accessType === 'key' && (
+            <div className="key-session-badge">
+              <span><small>KEY ĐANG DÙNG</small><strong>{accessSession.keyLabel || 'Người dùng'}</strong></span>
+              <button type="button" onClick={() => void logoutAccessKey()}>Thoát key</button>
+            </div>
+          )}
           <button type="button" className="play-demo-trigger" onClick={() => setPlayDemoOpen(true)}>
             <span aria-hidden="true">▶</span>
             <span><small>TRẢI NGHIỆM</small><strong>Chơi thử ngay</strong></span>
@@ -1242,6 +2302,15 @@ function App() {
         </div>
       </header>
 
+      <nav className="workspace-tabs" aria-label="Chuyển khu vực">
+        <button className={activeView === 'report' ? 'active' : ''} type="button" onClick={() => switchView('report')}>
+          <span aria-hidden="true">⌁</span><span><strong>Báo cầu</strong><small>Thống kê & dự đoán</small></span>
+        </button>
+        <button className={activeView === 'admin' ? 'active admin' : 'admin'} type="button" onClick={() => switchView('admin')}>
+          <span aria-hidden="true">⚙</span><span><strong>Quản trị</strong><small>{adminSession?.isAuthenticated ? 'Thiết bị & hệ thống' : 'Yêu cầu đăng nhập'}</small></span>
+        </button>
+      </nav>
+
       {error && <div className="error-banner">Không tải được backend: {error}</div>}
       {adminSession?.isAuthenticated && unacknowledgedEvents.length > 0 && (
         <div className="warning-banner">
@@ -1249,7 +2318,7 @@ function App() {
         </div>
       )}
 
-      {selectedDate === bangkokToday() && (
+      {activeView === 'report' && selectedDate === bangkokToday() && (
         <>
           <NextResultCountdown status={status} liveStatus={liveStatusRef} />
           <LiveBettingSignals status={status} />
@@ -1257,6 +2326,7 @@ function App() {
       )}
 
       <main>
+        {activeView === 'report' && <>
         <section className="metric-grid">
           <MetricCard label="Tổng Round trong ngày" value={liveRoundCount} tone="neutral" hint={`Đã nhận diện ${(stats?.totalResults ?? 0).toLocaleString('vi-VN')} · chốt lúc 23:00`} />
           <MetricCard label="Kèo scan miss / bảo trì" value={liveMissedRoundCount} tone="gold" hint={`Round ${liveRoundCount.toLocaleString('vi-VN')} − đã scan ${(stats?.totalResults ?? 0).toLocaleString('vi-VN')}`} />
@@ -1320,6 +2390,13 @@ function App() {
           {predictionError && !predictionLoading && <div className="prediction-inline-error">{predictionError}</div>}
           {predictionLoading && <PredictionLoading label="Đang tính dự đoán từ toàn bộ database" />}
         </section>
+
+        <MarketPredictionPanel
+          response={marketPredictionResponse}
+          loading={marketPredictionLoading}
+          error={marketPredictionError}
+          onRefresh={() => void refreshMarketPrediction()}
+        />
 
         <div className="ai-prediction-grid">
           <section className={`panel prediction-panel ai-prediction-panel ${aiPredictionLoading ? 'is-loading' : ''}`}>
@@ -1493,9 +2570,81 @@ function App() {
           </article>
         </section>
 
-        {adminSession?.isAuthenticated && <section className="lower-grid admin-only-section">
+        </>}
+
+        {activeView === 'admin' && adminSession?.isAuthenticated && <>
+          <section className="admin-view-heading">
+            <div><p className="panel-kicker">TRUNG TÂM QUẢN TRỊ</p><h2>Thiết bị, người dùng và vận hành</h2><p>Mỗi phiên được tách theo thiết bị và tab trình duyệt, kể cả khi dùng chung tài khoản Admin.</p></div>
+            <div className="admin-live-summary"><strong>{onlineVisitors.length}</strong><span>phiên đang online</span></div>
+          </section>
+
+          <section className="admin-device-overview">
+            <article className="panel current-device-card">
+              <div className="panel-heading"><div><p className="panel-kicker">THIẾT BỊ CỦA TÔI</p><h2>Phiên đăng nhập hiện tại</h2></div><span className="current-device-badge">Đang dùng</span></div>
+              {currentVisitor ? (
+                <button className="current-device-button" type="button" onClick={() => setSelectedVisitor(currentVisitor)}>
+                  <span className="device-avatar" aria-hidden="true">{currentVisitor.deviceType === 'Điện thoại' ? '▯' : '▰'}</span>
+                  <span><strong>{currentVisitor.deviceName}</strong><small>{currentVisitor.browser} · {currentVisitor.platform}</small><small>IP {currentVisitor.clientIp} · {currentVisitor.city || currentVisitor.region || currentVisitor.country || 'Chưa có vị trí từ mạng'}</small></span>
+                  <span className="device-online">● Online</span>
+                </button>
+              ) : <p className="muted">Đang nhận diện thông tin thiết bị hiện tại…</p>}
+            </article>
+            <article className="panel admin-status-card">
+              <div><span>Scanner</span><strong>{status?.isOnline ? 'Đang chạy' : 'Ngoại tuyến'}</strong></div>
+              <div><span>Admin online</span><strong>{onlineVisitors.filter(visitor => visitor.isAdmin).length}</strong></div>
+              <div><span>User online</span><strong>{onlineVisitors.filter(visitor => !visitor.isAdmin).length}</strong></div>
+            </article>
+          </section>
+
+          {selectedDate === bangkokToday() && <AutoPlayPanel adminSession={adminSession} />}
+          {selectedDate === bangkokToday() && <PhonePreviewPanel status={status} adminSession={adminSession} />}
+
+          <section className="lower-grid admin-only-section">
+          <article className="panel compact-panel access-key-admin-panel">
+            <div className="panel-heading">
+              <div><p className="panel-kicker">CẤP QUYỀN</p><h2>Quản lý key người dùng</h2></div>
+              <span className="subscriber-count">{accessKeys.filter(item => item.isActive && !item.isExpired).length} còn hạn</span>
+            </div>
+            <form className="access-key-create-form" onSubmit={createAccessKey}>
+              <label><span>Tên người dùng / ghi chú</span><input value={newKeyLabel} onChange={event => setNewKeyLabel(event.target.value)} placeholder="Ví dụ: Khách A" maxLength={120} /></label>
+              <label><span>Số ngày sử dụng</span><input type="number" min="1" max="3650" value={newKeyDays} onChange={event => setNewKeyDays(event.target.value)} required /></label>
+              <button type="submit" disabled={keyAdminSaving}>{keyAdminSaving ? 'Đang tạo...' : 'Tạo key mới'}</button>
+            </form>
+            {createdAccessKey && (
+              <div className="created-key-box">
+                <small>KEY VỪA TẠO · CHỈ HIỂN THỊ LẦN NÀY</small>
+                <strong>{createdAccessKey.key}</strong>
+                <span>Hết hạn: {formatDate(createdAccessKey.expiresAtUtc)}</span>
+                <button type="button" onClick={() => void copyCreatedAccessKey()}>Sao chép key</button>
+              </div>
+            )}
+            {keyAdminMessage && <p className="form-message">{keyAdminMessage}</p>}
+            <div className="access-key-list">
+              {accessKeys.map(item => (
+                <div className={`access-key-item ${item.isOnline ? 'online' : ''} ${!item.isActive || item.isExpired ? 'disabled' : ''}`} key={item.id}>
+                  <div className="access-key-main">
+                    <strong>{item.label}</strong>
+                    <code>{item.keyHint}</code>
+                    <small>Hết hạn {formatDate(item.expiresAtUtc)} · {item.isExpired ? 'Đã hết hạn' : item.isActive ? 'Đang mở' : 'Đã khóa'}</small>
+                  </div>
+                  <div className="access-key-device">
+                    <strong>{item.isOnline ? '● Đang online' : '○ Không hoạt động'}</strong>
+                    <span>{item.deviceName || 'Chưa đăng nhập'}{item.clientIp ? ` · ${item.clientIp}` : ''}</span>
+                    <small>{item.lastSeenUtc ? `Hoạt động ${formatDate(item.lastSeenUtc)}` : 'Chưa có phiên thiết bị'}</small>
+                  </div>
+                  <div className="access-key-actions">
+                    {item.lastSeenUtc && <button type="button" onClick={() => void disconnectAccessKey(item.id)}>Ngắt thiết bị</button>}
+                    <button type="button" onClick={() => void toggleAccessKey(item)}>{item.isActive ? 'Khóa key' : 'Mở key'}</button>
+                    <button type="button" onClick={() => void deleteAccessKey(item)}>Xóa</button>
+                  </div>
+                </div>
+              ))}
+              {accessKeys.length === 0 && <p className="muted">Chưa có key người dùng. Chọn số ngày rồi tạo key đầu tiên.</p>}
+            </div>
+          </article>
+
           <article className="panel compact-panel">
-            <div className="panel-heading"><div><p className="panel-kicker">SCANNER</p><h2>Sự kiện hệ thống</h2></div><span className="muted">Lỗi sẽ gửi AdminWebhookUrl</span></div>
+            <div className="panel-heading"><div><p className="panel-kicker">SCANNER</p><h2>Sự kiện hệ thống</h2></div><span className="muted">Chỉ lỗi mất cầu 6 phút mới gửi webhook</span></div>
             <div className="event-list">
               {events.slice(0, 10).map(event => (
                 <div className={`event-item ${event.severity.toLowerCase()}`} key={event.id}>
@@ -1508,22 +2657,47 @@ function App() {
           </article>
 
           <article className="panel compact-panel">
-            <div className="panel-heading"><div><p className="panel-kicker">WEBHOOK</p><h2>Cảnh báo chuỗi</h2></div></div>
+            <div className="panel-heading">
+              <div><p className="panel-kicker">WEBHOOK</p><h2>Cảnh báo mất cập nhật cầu</h2></div>
+              <span className={`webhook-status-pill ${alertWebhookConfig?.enabled ? 'online' : 'offline'}`}>
+                {alertWebhookConfig?.enabled ? 'Đang bật' : 'Đang tắt'}
+              </span>
+            </div>
+            <div className="webhook-config-box">
+              <label>
+                <span>URL webhook n8n / Zalo</span>
+                <input value={webhookUrlDraft} onChange={event => setWebhookUrlDraft(event.target.value)} placeholder="http://localhost:5678/webhook/..." />
+              </label>
+              <div className="webhook-config-actions">
+                <button type="button" onClick={() => void saveWebhookConfig()} disabled={webhookSaving}>Lưu URL</button>
+                <button type="button" onClick={() => void toggleWebhookConfig()} disabled={webhookSaving || (!alertWebhookConfig?.enabled && webhookUrlDraft.trim().length === 0)}>
+                  {alertWebhookConfig?.enabled ? 'Tắt thông báo' : 'Bật thông báo'}
+                </button>
+              </div>
+              {webhookMessage && <p className="form-message">{webhookMessage}</p>}
+            </div>
             <div className="alert-rules">
-              <div><span className="rule-dot vegetable" /><strong>15 Rau liên tục</strong><small>Gửi tới subscriber qua webhook</small></div>
-              <div><span className="rule-dot meat" /><strong>3 Thịt liên tục</strong><small>Gửi tới subscriber qua webhook</small></div>
+              <div><span className="rule-dot vegetable" /><strong>Không có cầu mới sau 6 phút</strong><small>Đây là điều kiện duy nhất được gửi tới webhook</small></div>
             </div>
-            <div className="event-list alert-deliveries">
-              {alerts.slice(0, 8).map(alert => (
-                <div className="event-item" key={alert.id}>
-                  <div><strong>{alert.ruleCode}</strong><span>Chuỗi {alert.streakLength} · {alert.status}</span></div>
-                  <time>{formatDate(alert.createdAtUtc)}</time>
-                </div>
-              ))}
-              {alerts.length === 0 && <p className="muted">Chưa chạm ngưỡng cảnh báo.</p>}
-            </div>
+            <p className="muted webhook-hint">Đã tắt cảnh báo bệt 3/10 và các lỗi nhận diện thiếu 8 ô. Các sự kiện đó vẫn có thể xem nội bộ ở mục Scanner nhưng không gửi Zalo.</p>
           </article>
-        </section>}
+
+          <article className="panel compact-panel">
+            <div className="panel-heading"><div><p className="panel-kicker">TRUY CẬP</p><h2>Thiết bị và người dùng</h2></div><span className="subscriber-count">{onlineVisitors.length} online</span></div>
+            <div className="visitor-list">
+              {visitors.slice(0, 30).map(visitor => (
+                <button className={`visitor-item ${visitor.isOnline ? 'online' : 'offline'} ${visitor.deviceId === getClientDeviceId() ? 'current' : ''}`} type="button" key={visitor.visitorId} onClick={() => setSelectedVisitor(visitor)}>
+                  <span className="visitor-device-icon" aria-hidden="true">{visitor.deviceType === 'Điện thoại' ? '▯' : '▰'}</span>
+                  <span className="visitor-main"><strong>{visitor.accountName || 'Khách chưa định danh'} · {visitor.deviceName}</strong><span>{visitor.accessType === 'admin' ? 'Quản trị viên' : visitor.accessType === 'key' ? 'Người dùng key' : 'Khách'} · IP {visitor.clientIp}</span><small>{visitor.browser} · {visitor.platform} · {visitor.city || visitor.region || visitor.country || 'Chưa có vị trí từ mạng'}</small></span>
+                  <span className="visitor-last-seen"><b>{visitor.isOnline ? '● Online' : '○ Offline'}</b><time>{formatTime(visitor.lastSeenUtc)}</time></span>
+                </button>
+              ))}
+              {visitors.length === 0 && <p className="muted">Chưa có lượt truy cập nào được ghi nhận.</p>}
+            </div>
+            <p className="muted webhook-hint">Bấm vào từng dòng để xem chi tiết. Vị trí chỉ hiển thị khi proxy/CDN gửi thông tin địa lý từ IP; hệ thống không tự xin quyền GPS.</p>
+          </article>
+          </section>
+        </>}
       </main>
 
       <PlayDemo
@@ -1578,6 +2752,43 @@ function App() {
         </div>
       )}
 
+      {selectedVisitor && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setSelectedVisitor(null)}>
+          <section className="visitor-detail-modal" role="dialog" aria-modal="true" aria-labelledby="visitor-detail-title" onClick={event => event.stopPropagation()}>
+            <div className="panel-heading visitor-detail-heading">
+              <div><p className="panel-kicker">CHI TIẾT PHIÊN TRUY CẬP</p><h2 id="visitor-detail-title">{selectedVisitor.accountName || 'Khách chưa định danh'}</h2></div>
+              <button className="close-button" type="button" aria-label="Đóng chi tiết thiết bị" onClick={() => setSelectedVisitor(null)}>×</button>
+            </div>
+            <div className="visitor-detail-hero">
+              <span className="device-avatar" aria-hidden="true">{selectedVisitor.deviceType === 'Điện thoại' ? '▯' : '▰'}</span>
+              <div><strong>{selectedVisitor.deviceName}</strong><span>{selectedVisitor.accessType === 'admin' ? 'Tài khoản Admin' : selectedVisitor.accessType === 'key' ? 'Tài khoản dùng key' : 'Chưa đăng nhập'}</span></div>
+              <b className={selectedVisitor.isOnline ? 'online' : 'offline'}>{selectedVisitor.isOnline ? '● Đang online' : '○ Đã offline'}</b>
+            </div>
+            <dl className="visitor-detail-grid">
+              <div><dt>Thiết bị</dt><dd>{selectedVisitor.deviceType}</dd></div>
+              <div><dt>Trình duyệt</dt><dd>{selectedVisitor.browser}</dd></div>
+              <div><dt>Nền tảng</dt><dd>{selectedVisitor.platform}</dd></div>
+              <div><dt>Địa chỉ IP</dt><dd>{selectedVisitor.clientIp}</dd></div>
+              <div><dt>Vị trí từ mạng</dt><dd>{[selectedVisitor.city, selectedVisitor.region, selectedVisitor.country].filter(Boolean).join(', ') || 'Không có dữ liệu'}</dd></div>
+              <div><dt>Ngôn ngữ trình duyệt</dt><dd>{selectedVisitor.browserLanguage || 'Không xác định'}</dd></div>
+              <div><dt>Múi giờ</dt><dd>{selectedVisitor.timeZone || 'Không xác định'}</dd></div>
+              <div><dt>Màn hình</dt><dd>{selectedVisitor.screenSize || 'Không xác định'} · khung nhìn {selectedVisitor.viewportSize || 'Không xác định'}</dd></div>
+              <div><dt>Mật độ điểm ảnh</dt><dd>{selectedVisitor.pixelRatio ?? 'Không xác định'}</dd></div>
+              <div><dt>Cảm ứng</dt><dd>{selectedVisitor.touchPoints ?? 0} điểm chạm</dd></div>
+              <div><dt>Kết nối</dt><dd>{selectedVisitor.connectionType || 'Không xác định'}</dd></div>
+              <div><dt>Trang gần nhất</dt><dd>{selectedVisitor.lastMethod} {selectedVisitor.lastPath}</dd></div>
+              <div><dt>Máy chủ / giao thức</dt><dd>{selectedVisitor.protocol || '—'} · {selectedVisitor.host || '—'}</dd></div>
+              <div><dt>Nguồn truy cập</dt><dd>{selectedVisitor.referrer || 'Truy cập trực tiếp'}</dd></div>
+              <div><dt>Bắt đầu phiên</dt><dd>{formatDate(selectedVisitor.firstSeenUtc)}</dd></div>
+              <div><dt>Hoạt động gần nhất</dt><dd>{formatDate(selectedVisitor.lastSeenUtc)}</dd></div>
+              <div><dt>Số request</dt><dd>{selectedVisitor.requestCount.toLocaleString('vi-VN')}</dd></div>
+              <div className="visitor-user-agent"><dt>Chuỗi nhận diện trình duyệt</dt><dd>{selectedVisitor.userAgent}</dd></div>
+              <div className="visitor-user-agent"><dt>Mã thiết bị / phiên</dt><dd>{selectedVisitor.deviceId} / {selectedVisitor.sessionId}</dd></div>
+            </dl>
+          </section>
+        </div>
+      )}
+
       {adminLoginOpen && (
         <div className="modal-backdrop" role="presentation" onClick={() => setAdminLoginOpen(false)}>
           <section className="admin-login-modal" role="dialog" aria-modal="true" aria-labelledby="admin-login-title" onClick={event => event.stopPropagation()}>
@@ -1592,6 +2803,8 @@ function App() {
             <form className="admin-login-form" onSubmit={loginAdmin}>
               <label><span>Tên đăng nhập</span><input autoComplete="username" value={adminUsername} onChange={event => setAdminUsername(event.target.value)} required /></label>
               <label><span>Mật khẩu</span><input type="password" autoComplete="current-password" value={adminPassword} onChange={event => setAdminPassword(event.target.value)} autoFocus required /></label>
+              <label className="remember-login"><input type="checkbox" checked={rememberAdmin} onChange={event => setRememberAdmin(event.target.checked)} /><span>Duy trì đăng nhập Admin trong 30 ngày</span></label>
+              <p className="login-security-note">Mật khẩu được trình duyệt tự điền an toàn; ứng dụng không lưu mật khẩu dạng rõ.</p>
               {adminAuthError && <p className="admin-login-error">{adminAuthError}</p>}
               {!adminSession?.isConfigured && adminSession !== null && <p className="admin-login-error">Backend chưa có tài khoản Admin.</p>}
               <button className="admin-login-submit" type="submit" disabled={adminAuthLoading || !adminSession?.isConfigured}>{adminAuthLoading ? 'Đang xác thực...' : 'Mở khu vực quản trị'}</button>

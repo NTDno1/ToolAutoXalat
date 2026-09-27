@@ -16,15 +16,23 @@ $listenerLine = netstat -ano -p tcp |
 if ($listenerLine) {
     if ($listenerLine -notmatch '(\d+)\s*$') { throw 'Cannot resolve backend listener PID.' }
     $listenerPid = [int]$Matches[1]
-    $listener = Get-CimInstance Win32_Process -Filter "ProcessId = $listenerPid"
-    if (-not $listener -or $listener.CommandLine -notlike "*$projectRoot*GreedyStats.Api*") {
+    $listener = Get-Process -Id $listenerPid -ErrorAction SilentlyContinue
+    $expectedBackendPath = Join-Path $backendDir 'bin\Release\net8.0\GreedyStats.Api.exe'
+    if (-not $listener -or -not $listener.Path -or
+        -not [string]::Equals(
+            [System.IO.Path]::GetFullPath($listener.Path),
+            [System.IO.Path]::GetFullPath($expectedBackendPath),
+            [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Port 5117 is owned by an unrelated process (PID $listenerPid)."
     }
 
-    $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.ParentProcessId)" -ErrorAction SilentlyContinue
     Stop-Process -Id $listenerPid -Force
-    if ($parent -and $parent.CommandLine -like '*dotnet*run*5117*') {
-        Stop-Process -Id $parent.ProcessId -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $statePath) {
+        $previousState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        $parent = Get-Process -Id $previousState.backendPid -ErrorAction SilentlyContinue
+        if ($parent -and $parent.ProcessName -eq 'dotnet') {
+            Stop-Process -Id $parent.Id -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 

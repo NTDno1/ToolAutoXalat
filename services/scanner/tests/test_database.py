@@ -13,6 +13,51 @@ from database import ScannerDatabase  # noqa: E402
 
 
 class ResultReconciliationTests(unittest.TestCase):
+    def test_betting_signal_snapshot_is_updated_per_round(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scanner.db"
+            database = ScannerDatabase(path)
+            database.upsert_betting_signal_snapshot(
+                "test-device",
+                "2026-09-19",
+                42,
+                "2026-09-19T10:00:00.000Z",
+                "CAI",
+                [{"itemCode": "CAI", "coinCount": 1, "activityPercent": 33}],
+            )
+            database.upsert_betting_signal_snapshot(
+                "test-device",
+                "2026-09-19",
+                42,
+                "2026-09-19T10:00:10.000Z",
+                "CAI",
+                [{"itemCode": "CAI", "coinCount": 3, "activityPercent": 100}],
+            )
+            # A scanner restart or a short animation must not lower the
+            # strongest crowd level already recorded for this round.
+            database.upsert_betting_signal_snapshot(
+                "test-device",
+                "2026-09-19",
+                42,
+                "2026-09-19T10:00:15.000Z",
+                None,
+                [{"itemCode": "CAI", "coinCount": 1, "activityPercent": 33}],
+            )
+
+            with closing(sqlite3.connect(path)) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT round_number, hot_item_code, items_json
+                    FROM betting_signal_snapshots
+                    """
+                ).fetchall()
+
+            self.assertEqual(1, len(rows))
+            self.assertEqual(42, rows[0][0])
+            self.assertEqual("CAI", rows[0][1])
+            self.assertIn('"coinCount":3', rows[0][2])
+            self.assertIn('"activityPercent":100', rows[0][2])
+
     def test_provisional_result_is_corrected_in_place(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "scanner.db"

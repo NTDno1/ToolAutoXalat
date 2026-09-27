@@ -9,7 +9,7 @@ if (Test-Path -LiteralPath $statePath) {
         @{ Name = 'Backend'; Pid = $state.backendPid },
         @{ Name = 'Frontend'; Pid = $state.frontendPid },
         @{ Name = 'Scanner'; Pid = $state.scannerPid },
-        @{ Name = 'Cloudflare'; Pid = $state.cloudflaredPid }
+        @{ Name = 'zrok agent'; Pid = $state.zrokAgentPid }
     )) {
         if (-not $entry.Pid) { continue }
         $process = Get-Process -Id $entry.Pid
@@ -20,6 +20,15 @@ if (Test-Path -LiteralPath $statePath) {
         }
     }
     $rows | Format-Table -AutoSize
+    if ($state.publicUrl) {
+        Write-Host "Public URL: $($state.publicUrl) [$($state.tunnelProvider)]"
+    }
+    if ($state.tunnelProvider -eq 'zrok') {
+        $zrokPath = Join-Path $env:LOCALAPPDATA 'ToolAutoXalat\zrok2\zrok2.exe'
+        if (Test-Path -LiteralPath $zrokPath) {
+            & $zrokPath agent status
+        }
+    }
 } else {
     Write-Host 'Chưa có runtime\processes.json.'
 }

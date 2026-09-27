@@ -2,11 +2,17 @@ using System.Globalization;
 using System.Text.Json;
 using GreedyStats.Api.Models;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Configuration;
 
 namespace GreedyStats.Api.Data;
 
 public sealed class GreedyDatabase
 {
+    private static readonly JsonSerializerOptions WebJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
     private const string Schema = """
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
@@ -43,6 +49,17 @@ public sealed class GreedyDatabase
             state_key TEXT PRIMARY KEY,
             state_value TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS betting_signal_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_serial TEXT NOT NULL,
+            round_local_date TEXT NOT NULL,
+            round_number INTEGER NOT NULL,
+            observed_at_utc TEXT NOT NULL,
+            hot_item_code TEXT,
+            items_json TEXT NOT NULL,
+            UNIQUE(source_serial, round_local_date, round_number)
         );
 
         CREATE TABLE IF NOT EXISTS alert_deliveries (
@@ -92,6 +109,10 @@ public sealed class GreedyDatabase
         CREATE INDEX IF NOT EXISTS ix_scanner_events_occurred_at
             ON scanner_events(occurred_at_utc DESC);
         CREATE INDEX IF NOT EXISTS ix_subscribers_active ON subscribers(is_active, id DESC);
+        CREATE INDEX IF NOT EXISTS ix_betting_signal_snapshots_round
+            ON betting_signal_snapshots(round_local_date DESC, round_number DESC);
+        CREATE INDEX IF NOT EXISTS ix_betting_signal_snapshots_observed
+            ON betting_signal_snapshots(observed_at_utc DESC, id DESC);
         """;
 
     private static readonly string[] ItemCodes =
@@ -261,12 +282,14 @@ public sealed class GreedyDatabase
         CancellationToken cancellationToken = default)
     {
         var rows = ApplyStreakLengths(await LoadResultsForDateAsync(localDate, cancellationToken));
-        var maximumRecordedRound = rows
-            .Where(row => row.RoundNumber.HasValue)
-            .Select(row => row.RoundNumber!.Value)
-            .DefaultIfEmpty(0)
-            .Max();
-        var observedRound = maximumRecordedRound;
+        // Use the latest chronologically observed round, not the numeric
+        // maximum. A stale OCR value from the previous business day can be
+        // much larger than the current cycle and must not inflate the whole
+        // day's round/miss totals.
+        var latestRecordedRound = rows
+            .LastOrDefault(row => row.RoundNumber.HasValue)
+            ?.RoundNumber ?? 0;
+        var observedRound = latestRecordedRound;
         if (localDate == LocalToday)
         {
             var scanner = await GetScannerStatusAsync(cancellationToken);
@@ -587,6 +610,42 @@ public sealed class GreedyDatabase
                 // Incomplete scanner writes and old formats are ignored.
             }
         }
+        ScannerFinancialsDto? financials = null;
+        if (state.TryGetValue("scanner_financials", out var financialsRaw))
+        {
+            try
+            {
+                using var financialJson = JsonDocument.Parse(financialsRaw);
+                var root = financialJson.RootElement;
+                if (DateTimeOffset.TryParse(
+                        root.GetProperty("observedAtUtc").GetString(),
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal,
+                        out var observedAt) &&
+                    (DateTimeOffset.UtcNow - observedAt).TotalSeconds <= 8 &&
+                    root.GetProperty("balanceUnits").TryGetDecimal(out var balance))
+                {
+                    var ownBets = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+                    if (root.TryGetProperty("ownBets", out var betsElement) &&
+                        betsElement.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var property in betsElement.EnumerateObject())
+                        {
+                            if (property.Value.TryGetDecimal(out var amount) && amount >= 0)
+                            {
+                                ownBets[property.Name] = amount;
+                            }
+                        }
+                    }
+                    financials = new ScannerFinancialsDto(observedAt, balance, ownBets);
+                }
+            }
+            catch (Exception exception) when (
+                exception is JsonException or InvalidOperationException or KeyNotFoundException)
+            {
+                // Partial OCR state is ignored; stale balance must never drive LIVE bets.
+            }
+        }
         var online = heartbeat.HasValue &&
                      (DateTimeOffset.UtcNow - heartbeat.Value).TotalSeconds <= _offlineAfterSeconds;
         return new ScannerStatusDto(
@@ -603,7 +662,126 @@ public sealed class GreedyDatabase
             countdownSeconds,
             countdownObservedAt,
             bettingSignals,
+            financials,
             DateTimeOffset.UtcNow);
+    }
+
+    public async Task<string?> GetResultItemForRoundAsync(
+        string localDate,
+        int roundNumber,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT item_code
+            FROM results
+            WHERE round_local_date=$date AND round_number=$round
+            ORDER BY detected_at_utc DESC, id DESC
+            LIMIT 1
+            """;
+        command.Parameters.AddWithValue("$date", localDate);
+        command.Parameters.AddWithValue("$round", roundNumber);
+        return await command.ExecuteScalarAsync(cancellationToken) as string;
+    }
+
+    public async Task<IReadOnlyDictionary<string, string>> GetRecentRoundResultsAsync(
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        var results = new Dictionary<string, string>(StringComparer.Ordinal);
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT round_local_date, round_number, item_code
+            FROM results
+            WHERE round_local_date IS NOT NULL AND round_number IS NOT NULL
+            ORDER BY detected_at_utc DESC, id DESC
+            LIMIT $limit
+            """;
+        command.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 2000));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var key = $"{reader.GetString(0)}#{reader.GetInt32(1)}";
+            results.TryAdd(key, reader.GetString(2));
+        }
+        return results;
+    }
+
+    public async Task<AlertWebhookConfigDto> GetAlertWebhookConfigAsync(
+        IConfiguration configuration,
+        CancellationToken cancellationToken = default)
+    {
+        string? enabledRaw = null;
+        string? urlRaw = null;
+        DateTimeOffset? updatedAt = null;
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT state_key, state_value, updated_at_utc
+            FROM scanner_state
+            WHERE state_key IN ('alerts_webhook_enabled', 'alerts_webhook_url')
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var key = reader.GetString(0);
+            var value = reader.GetString(1);
+            var rowUpdatedAt = ParseUtc(reader.GetString(2));
+            if (updatedAt is null || rowUpdatedAt > updatedAt) updatedAt = rowUpdatedAt;
+            if (key == "alerts_webhook_enabled") enabledRaw = value;
+            if (key == "alerts_webhook_url") urlRaw = value;
+        }
+
+        var fallbackUrl = ResolveConfiguredWebhookUrl(configuration) ?? string.Empty;
+        var webhookUrl = string.IsNullOrWhiteSpace(urlRaw) ? fallbackUrl : urlRaw.Trim();
+        var enabled = string.Equals(enabledRaw, "true", StringComparison.OrdinalIgnoreCase) || enabledRaw == "1";
+        return new AlertWebhookConfigDto(
+            enabled && !string.IsNullOrWhiteSpace(webhookUrl),
+            !string.IsNullOrWhiteSpace(webhookUrl),
+            webhookUrl,
+            updatedAt);
+    }
+
+    public async Task<AlertWebhookConfigDto> SetAlertWebhookConfigAsync(
+        AlertWebhookConfigRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var webhookUrl = request.WebhookUrl?.Trim() ?? string.Empty;
+        var enabled = request.Enabled && !string.IsNullOrWhiteSpace(webhookUrl);
+        var now = ToUtcText(DateTime.UtcNow);
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO scanner_state(state_key, state_value, updated_at_utc)
+            VALUES ('alerts_webhook_enabled', $enabled, $now)
+            ON CONFLICT(state_key) DO UPDATE SET
+                state_value=excluded.state_value,
+                updated_at_utc=excluded.updated_at_utc;
+            INSERT INTO scanner_state(state_key, state_value, updated_at_utc)
+            VALUES ('alerts_webhook_url', $webhookUrl, $now)
+            ON CONFLICT(state_key) DO UPDATE SET
+                state_value=excluded.state_value,
+                updated_at_utc=excluded.updated_at_utc;
+            """;
+        command.Parameters.AddWithValue("$enabled", enabled ? "true" : "false");
+        command.Parameters.AddWithValue("$webhookUrl", webhookUrl);
+        command.Parameters.AddWithValue("$now", now);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+        return new AlertWebhookConfigDto(
+            enabled,
+            !string.IsNullOrWhiteSpace(webhookUrl),
+            webhookUrl,
+            ParseUtc(now));
+    }
+
+    public async Task<string?> ResolveAlertWebhookUrlAsync(
+        IConfiguration configuration,
+        CancellationToken cancellationToken = default)
+    {
+        var config = await GetAlertWebhookConfigAsync(configuration, cancellationToken);
+        return config.Enabled && config.Configured ? config.WebhookUrl : null;
     }
 
     public async Task<IReadOnlyList<AlertDeliveryDto>> GetAlertDeliveriesAsync(
@@ -694,12 +872,15 @@ public sealed class GreedyDatabase
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            INSERT OR IGNORE INTO alert_deliveries(
+            INSERT INTO alert_deliveries(
                 alert_key, rule_code, category, streak_length, result_id, status,
                 payload_json, created_at_utc
-            ) VALUES (
+            )
+            SELECT
                 $alertKey, $ruleCode, $category, $streakLength, $resultId, $status,
                 $payload, $createdAt
+            WHERE NOT EXISTS (
+                SELECT 1 FROM alert_deliveries WHERE alert_key=$alertKey
             );
             UPDATE alert_deliveries SET status='PENDING'
             WHERE alert_key=$alertKey AND $configured=1 AND (
@@ -819,11 +1000,21 @@ public sealed class GreedyDatabase
             SELECT e.id, e.severity, e.event_code, e.message, e.details_json, e.occurred_at_utc
             FROM scanner_events e
             LEFT JOIN system_event_deliveries d ON d.event_id=e.id
-            WHERE e.severity IN ('ERROR', 'CRITICAL')
+            WHERE e.event_code='SCANNER_RESULT_STALLED'
               AND (
                   (d.id IS NULL AND e.occurred_at_utc >= $notBefore) OR
                   d.status IN ('PENDING', 'PENDING_CONFIGURATION') OR
-                  (d.status='RETRY' AND (d.attempted_at_utc IS NULL OR d.attempted_at_utc <= $retryBefore))
+                  (
+                      d.status='RETRY'
+                      AND (d.attempted_at_utc IS NULL OR d.attempted_at_utc <= $retryBefore)
+                      AND (
+                          e.occurred_at_utc >= $notBefore OR
+                          (
+                              d.created_at_utc IS NOT NULL AND
+                              (julianday(d.created_at_utc) - julianday(e.occurred_at_utc)) * 1440.0 <= $bootstrapMaxAgeMinutes
+                          )
+                      )
+                  )
               )
             ORDER BY e.id ASC
             LIMIT 1
@@ -834,6 +1025,7 @@ public sealed class GreedyDatabase
         command.Parameters.AddWithValue(
             "$notBefore",
             ToUtcText(DateTime.UtcNow.AddMinutes(-Math.Max(1, bootstrapMaxAgeMinutes))));
+        command.Parameters.AddWithValue("$bootstrapMaxAgeMinutes", Math.Max(1, bootstrapMaxAgeMinutes));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
         {
@@ -858,8 +1050,11 @@ public sealed class GreedyDatabase
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            INSERT OR IGNORE INTO system_event_deliveries(event_id, status, created_at_utc)
-            VALUES ($eventId, $status, $now);
+            INSERT INTO system_event_deliveries(event_id, status, created_at_utc)
+            SELECT $eventId, $status, $now
+            WHERE NOT EXISTS (
+                SELECT 1 FROM system_event_deliveries WHERE event_id=$eventId
+            );
             UPDATE system_event_deliveries SET status='PENDING'
             WHERE event_id=$eventId AND $configured=1 AND (
                 status='PENDING_CONFIGURATION' OR
@@ -949,6 +1144,143 @@ public sealed class GreedyDatabase
             historicalCounts,
             today.ItemCounts,
             history);
+    }
+
+    public async Task<string?> GetStateValueAsync(
+        string key,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT state_value FROM scanner_state WHERE state_key=$key";
+        command.Parameters.AddWithValue("$key", key);
+        return await command.ExecuteScalarAsync(cancellationToken) as string;
+    }
+
+    public async Task SetStateValueAsync(
+        string key,
+        string value,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO scanner_state(state_key, state_value, updated_at_utc)
+            VALUES ($key, $value, $now)
+            ON CONFLICT(state_key) DO UPDATE SET
+                state_value=excluded.state_value,
+                updated_at_utc=excluded.updated_at_utc
+            """;
+        command.Parameters.AddWithValue("$key", key);
+        command.Parameters.AddWithValue("$value", value);
+        command.Parameters.AddWithValue("$now", ToUtcText(DateTime.UtcNow));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<PredictionContextDto> GetRecentPredictionContextAsync(
+        DateOnly localDate,
+        IReadOnlyDictionary<string, double> payoutMultipliers,
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        var history = new List<PredictionHistoryItemDto>();
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT id, round_number, round_local_date, source_serial,
+                   item_code, category, detected_at_utc
+            FROM (
+                SELECT id, round_number, round_local_date, source_serial,
+                       item_code, category, detected_at_utc
+                FROM results
+                ORDER BY detected_at_utc DESC, id DESC
+                LIMIT $limit
+            ) recent
+            ORDER BY detected_at_utc ASC, id ASC
+            """;
+        command.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 5000));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var detectedAt = ParseUtc(reader.GetString(6));
+            var businessDate = reader.IsDBNull(2)
+                ? GetBusinessDate(TimeZoneInfo.ConvertTime(detectedAt, _timeZone))
+                    .ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+                : reader.GetString(2);
+            history.Add(new PredictionHistoryItemDto(
+                reader.GetInt64(0),
+                reader.IsDBNull(1) ? null : reader.GetInt32(1),
+                businessDate,
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(5),
+                detectedAt));
+        }
+
+        var historicalCounts = ItemCodes.ToDictionary(code => code, _ => 0L);
+        var todayCounts = ItemCodes.ToDictionary(code => code, _ => 0L);
+        var localDateText = localDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        foreach (var item in history)
+        {
+            historicalCounts[item.ItemCode] = historicalCounts.GetValueOrDefault(item.ItemCode) + 1;
+            if (item.RoundLocalDate == localDateText)
+            {
+                todayCounts[item.ItemCode] = todayCounts.GetValueOrDefault(item.ItemCode) + 1;
+            }
+        }
+
+        return new PredictionContextDto(
+            localDateText,
+            payoutMultipliers,
+            historicalCounts,
+            todayCounts,
+            history);
+    }
+
+    public async Task<IReadOnlyList<BettingSignalSnapshotDto>> GetRecentBettingSignalSnapshotsAsync(
+        int limit = 500,
+        CancellationToken cancellationToken = default)
+    {
+        var snapshots = new List<BettingSignalSnapshotDto>();
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT s.id, s.source_serial, s.round_local_date, s.round_number,
+                   s.observed_at_utc, s.hot_item_code, s.items_json, r.item_code
+            FROM betting_signal_snapshots s
+            LEFT JOIN results r
+              ON r.source_serial = s.source_serial
+             AND r.round_local_date = s.round_local_date
+             AND r.round_number = s.round_number
+            ORDER BY s.observed_at_utc DESC, s.id DESC
+            LIMIT $limit
+            """;
+        command.Parameters.AddWithValue("$limit", Math.Clamp(limit, 1, 5000));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            IReadOnlyList<BettingSignalItemDto> items;
+            try
+            {
+                items = JsonSerializer.Deserialize<List<BettingSignalItemDto>>(
+                    reader.GetString(6), WebJsonOptions) ?? [];
+            }
+            catch (JsonException)
+            {
+                items = [];
+            }
+            snapshots.Add(new BettingSignalSnapshotDto(
+                reader.GetInt64(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetInt32(3),
+                ParseUtc(reader.GetString(4)),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                items,
+                reader.IsDBNull(7) ? null : reader.GetString(7)));
+        }
+        snapshots.Reverse();
+        return snapshots;
     }
 
     private static IReadOnlyList<StreakBucketDto> BuildBuckets(
@@ -1111,6 +1443,16 @@ public sealed class GreedyDatabase
             reader.GetInt64(3) != 0,
             ParseUtc(reader.GetString(4)),
             ParseUtc(reader.GetString(5)));
+
+    private static string? ResolveConfiguredWebhookUrl(IConfiguration configuration) =>
+        new[]
+        {
+            configuration["Alerts:WebhookUrl"],
+            configuration["Alerts:UserWebhookUrl"],
+            configuration["Alerts:AdminWebhookUrl"]
+        }
+        .Select(value => value?.Trim())
+        .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
 
     private static DateTimeOffset ParseUtc(string value) =>
         DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal);

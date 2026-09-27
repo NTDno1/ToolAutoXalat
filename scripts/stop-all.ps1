@@ -25,7 +25,7 @@ function Stop-ProjectTree([int]$ProcessId) {
 
 # These PIDs come only from start-all.ps1 and therefore cannot target unrelated
 # processes unless the state file was manually altered.
-foreach ($processId in @($state.scannerPid, $state.frontendPid, $state.backendPid)) {
+foreach ($processId in @($state.scannerPid, $state.frontendPid, $state.backendPid, $state.zrokAgentPid, $state.cloudflaredPid)) {
     if ($processId) { Stop-ProjectTree -ProcessId ([int]$processId) }
 }
 

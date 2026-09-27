@@ -35,7 +35,6 @@ public sealed class AlertMonitorService : BackgroundService
         {
             try
             {
-                await EvaluateStreakAlertAsync(stoppingToken);
                 await EvaluateScannerWatchdogAsync(stoppingToken);
                 await EvaluateSystemEventAsync(stoppingToken);
             }
@@ -90,16 +89,7 @@ public sealed class AlertMonitorService : BackgroundService
                     "Scanner bị treo hoặc đã dừng cập nhật heartbeat",
                     details,
                     now), cancellationToken);
-                return;
             }
-        }
-
-        if (
-            !scanner.IsOnline
-            || scanner.Status.StartsWith("PHONE_RECONNECT", StringComparison.Ordinal)
-        )
-        {
-            return;
         }
 
         var revision = scanner.LastResultRevision ?? "NO_RESULT";
@@ -112,8 +102,8 @@ public sealed class AlertMonitorService : BackgroundService
         }
 
         var resultLimit = Math.Max(
-            45,
-            _configuration.GetValue("Alerts:ResultProgressStaleSeconds", 90));
+            60,
+            _configuration.GetValue("Alerts:ResultProgressStaleSeconds", 360));
         var unchangedSeconds = (now - _resultRevisionObservedAtUtc).TotalSeconds;
         if (
             unchangedSeconds >= resultLimit
@@ -134,7 +124,7 @@ public sealed class AlertMonitorService : BackgroundService
                 $"backend:SCANNER_RESULT_STALLED:{scanner.SourceSerial}:{_resultRevisionObservedAtUtc:yyyyMMddHHmmssfff}",
                 "ERROR",
                 "SCANNER_RESULT_STALLED",
-                "Scanner vẫn online nhưng không ghi nhận được các cầu tiếp theo",
+                $"Đã {Math.Round(unchangedSeconds / 60d, 1):0.#} phút chưa cập nhật được cầu mới",
                 details,
                 now), cancellationToken);
             _resultStallAlertedRevision = revision;
@@ -145,7 +135,7 @@ public sealed class AlertMonitorService : BackgroundService
     {
         var vegetableThreshold = _configuration.GetValue("Alerts:VegetableStreakThreshold", 10);
         var meatThreshold = _configuration.GetValue("Alerts:MeatStreakThreshold", 3);
-        var webhookUrl = ResolveWebhookUrl();
+        var webhookUrl = await _database.ResolveAlertWebhookUrlAsync(_configuration, cancellationToken);
         var candidate = await _database.GetCurrentAlertCandidateAsync(
             vegetableThreshold,
             meatThreshold,
@@ -225,7 +215,7 @@ public sealed class AlertMonitorService : BackgroundService
         {
             return;
         }
-        var webhookUrl = ResolveWebhookUrl();
+        var webhookUrl = await _database.ResolveAlertWebhookUrlAsync(_configuration, cancellationToken);
         var configured = !string.IsNullOrWhiteSpace(webhookUrl);
         var status = await _database.EnsureSystemEventDeliveryAsync(
             candidate.EventId, configured, retrySeconds, cancellationToken);
@@ -239,7 +229,7 @@ public sealed class AlertMonitorService : BackgroundService
             "SCANNER_SYSTEM_EVENT",
             candidate.EventCode,
             candidate.Severity,
-            "Cảnh báo hệ thống scanner",
+            "Cầu chưa cập nhật sau 6 phút",
             candidate.Message,
             candidate.OccurredAtUtc,
             new
@@ -273,16 +263,6 @@ public sealed class AlertMonitorService : BackgroundService
 
     private static string Truncate(string value) =>
         value.Length > 2000 ? value[..2000] : value;
-
-    private string? ResolveWebhookUrl() =>
-        new[]
-        {
-            _configuration["Alerts:WebhookUrl"],
-            _configuration["Alerts:UserWebhookUrl"],
-            _configuration["Alerts:AdminWebhookUrl"]
-        }
-        .Select(value => value?.Trim())
-        .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
 
     private static object CreateEnvelope(
         string notificationId,

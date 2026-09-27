@@ -6,7 +6,17 @@ export default defineConfig({
         host: '127.0.0.1',
         port: 5173,
         strictPort: true,
-        allowedHosts: ['.trycloudflare.com'],
+        allowedHosts: ['.trycloudflare.com', '.share.zrok.io', '.ngrok-free.dev'],
+        proxy: {
+            '/api': 'http://127.0.0.1:5117',
+            '/health': 'http://127.0.0.1:5117',
+        },
+    },
+    preview: {
+        host: '127.0.0.1',
+        port: 5173,
+        strictPort: true,
+        allowedHosts: ['.trycloudflare.com', '.share.zrok.io', '.ngrok-free.dev'],
         proxy: {
             '/api': 'http://127.0.0.1:5117',
             '/health': 'http://127.0.0.1:5117',

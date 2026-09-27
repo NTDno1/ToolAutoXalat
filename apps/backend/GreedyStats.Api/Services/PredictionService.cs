@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -45,6 +46,13 @@ public sealed class PredictionService
             ["BO"] = ("Bò", "MEAT")
         };
 
+    // The game board also groups the eight normal outcomes into two visual
+    // sides. This signal is independent from the VEGETABLE/MEAT categories.
+    private static readonly HashSet<string> RedSideCodes =
+    [
+        "CA_CHUA", "BANH_MI", "CA_ROT", "BO"
+    ];
+
     // One character per result keeps every database row in the AI payload
     // without exhausting the provider's free-tier token budget.
     private static readonly IReadOnlyDictionary<string, string> CompactItemCodes =
@@ -68,6 +76,9 @@ public sealed class PredictionService
     private readonly ILogger<PredictionService> _logger;
     private readonly AiChannelCache _gptCache = new();
     private readonly AiChannelCache _compoundCache = new();
+    private readonly SemaphoreSlim _marketContextLock = new(1, 1);
+    private string? _marketContextKey;
+    private PredictionContextDto? _marketContext;
 
     public PredictionService(
         GreedyDatabase database,
@@ -95,6 +106,172 @@ public sealed class PredictionService
     {
         var context = await GetContextAsync(localDate, cancellationToken);
         return BuildHeuristic(context);
+    }
+
+    public async Task<MarketPredictionResponseDto> GetMarketPredictionAsync(
+        DateOnly localDate,
+        CancellationToken cancellationToken = default)
+    {
+        const int analysisWindow = 500;
+        const int fallbackCountdownSeconds = 20;
+        var stopwatch = Stopwatch.StartNew();
+        var scannerTask = _database.GetScannerStatusAsync(cancellationToken);
+        var signalsTask = _database.GetRecentBettingSignalSnapshotsAsync(
+            analysisWindow + 20,
+            cancellationToken);
+        await Task.WhenAll(scannerTask, signalsTask);
+        var scanner = await scannerTask;
+        var snapshots = await signalsTask;
+        var observedSignals = scanner.BettingSignals;
+        var activeRound = scanner.ActiveRound ?? observedSignals?.Round;
+        var countdownSeconds = scanner.CountdownSeconds ?? (
+            observedSignals is not null && observedSignals.Round == activeRound
+                ? observedSignals.CountdownSeconds
+                : null);
+        var liveSignals = observedSignals is not null &&
+                          observedSignals.Round == activeRound &&
+                          DateTimeOffset.UtcNow - observedSignals.ObservedAtUtc <= TimeSpan.FromSeconds(5)
+            ? observedSignals
+            : null;
+        var hasHotSignal = !string.IsNullOrWhiteSpace(liveSignals?.HotItemCode);
+        var hasCoinSignal = liveSignals?.Items.Any(item =>
+            item.CoinCount > 0 || item.ActivityPercent > 0) == true;
+        var hasOptionalMarketSignal = hasHotSignal || hasCoinSignal;
+        var fallbackDeadlineReached = countdownSeconds is > 0 and <= fallbackCountdownSeconds;
+        var housePerformance = AnalyzeHousePerformance(snapshots, liveSignals);
+        var hotOutcomeStats = AnalyzeHotOutcomes(snapshots, liveSignals?.HotItemCode);
+        var matchedRounds = snapshots.Count(snapshot =>
+            snapshot.ResultItemCode is not null &&
+            PayoutMultipliers.ContainsKey(snapshot.ResultItemCode));
+        matchedRounds = Math.Min(analysisWindow, matchedRounds);
+
+        // Recalculate and cache the 500-result baseline as soon as a new round
+        // is visible. When HOT/coin OCR arrives later in the same round, only
+        // the cheap live-signal merge remains.
+        PredictionContextDto? preparedContext = null;
+        var preparingRound = activeRound;
+        if (localDate == _database.LocalToday && scanner.IsOnline && preparingRound is not null)
+        {
+            preparedContext = await GetPreparedMarketContextAsync(
+                localDate,
+                scanner.SourceSerial,
+                preparingRound.Value,
+                scanner.LastResultId,
+                analysisWindow,
+                cancellationToken);
+        }
+
+        MarketPredictionResponseDto Waiting(string status, string message) => new(
+            status,
+            message,
+            liveSignals?.Round ?? scanner.ActiveRound,
+            liveSignals?.CountdownSeconds ?? scanner.CountdownSeconds,
+            liveSignals?.ObservedAtUtc,
+            liveSignals?.HotItemCode,
+            analysisWindow,
+            matchedRounds,
+            housePerformance,
+            hotOutcomeStats,
+            null,
+            "CPU",
+            stopwatch.ElapsedMilliseconds,
+            null);
+
+        if (localDate != _database.LocalToday)
+        {
+            return Waiting(
+                "NO_LIVE_ROUND",
+                "Mô hình HOT/xu chỉ chốt cho cầu đang chạy của ngày hiện tại.");
+        }
+        if (!scanner.IsOnline || activeRound is null)
+        {
+            return Waiting(
+                "WAITING_ROUND",
+                "Đang chờ scanner nhận diện round mới để tính sẵn nền 500 cầu.");
+        }
+        if (countdownSeconds <= 0)
+        {
+            return Waiting(
+                "WAITING_NEXT_ROUND",
+                "Cầu hiện tại đã khóa cược; đang chờ round mới để tính lại nền dữ liệu.");
+        }
+        if (!hasOptionalMarketSignal && !fallbackDeadlineReached)
+        {
+            return Waiting(
+                "WAITING_SIGNAL",
+                $"Đã tính xong nền 500 cầu. Chờ HOT/xu tối đa 10 giây đầu; nếu không có sẽ tự chốt khi đồng hồ còn {fallbackCountdownSeconds} giây.");
+        }
+
+        var context = preparedContext ?? await GetPreparedMarketContextAsync(
+            localDate,
+            scanner.SourceSerial,
+            activeRound.Value,
+            scanner.LastResultId,
+            analysisWindow,
+            cancellationToken);
+        var current = new BettingSignalSnapshotDto(
+            0,
+            scanner.SourceSerial ?? string.Empty,
+            context.LocalDate,
+            activeRound.Value,
+            liveSignals?.ObservedAtUtc ?? scanner.CountdownObservedAtUtc ?? DateTimeOffset.UtcNow,
+            liveSignals?.HotItemCode,
+            liveSignals?.Items ?? [],
+            null);
+        var result = BuildMarketSignalPrediction(
+            context,
+            snapshots,
+            current,
+            housePerformance);
+        var signalMessage = hasOptionalMarketSignal
+            ? $"Đã phân tích ngay khi nhận được {(hasHotSignal && hasCoinSignal ? "HOT và xu" : hasHotSignal ? "HOT" : "xu")} của round {activeRound}."
+            : $"Không có HOT/xu trong 10 giây đầu; đã tự chốt bằng nền 500 cầu và cầu Đỏ/Xanh của round {activeRound}.";
+        return new MarketPredictionResponseDto(
+            "READY",
+            $"{signalMessage} Đồng hồ còn {countdownSeconds?.ToString() ?? "--"} giây.",
+            activeRound,
+            countdownSeconds,
+            liveSignals?.ObservedAtUtc ?? scanner.CountdownObservedAtUtc,
+            liveSignals?.HotItemCode,
+            analysisWindow,
+            matchedRounds,
+            housePerformance,
+            hotOutcomeStats,
+            result.SideForecast,
+            "CPU",
+            stopwatch.ElapsedMilliseconds,
+            result.Prediction);
+    }
+
+    private async Task<PredictionContextDto> GetPreparedMarketContextAsync(
+        DateOnly localDate,
+        string? sourceSerial,
+        int roundNumber,
+        long? lastResultId,
+        int analysisWindow,
+        CancellationToken cancellationToken)
+    {
+        var key = $"{localDate:yyyy-MM-dd}|{sourceSerial}|{roundNumber}|{lastResultId}";
+        await _marketContextLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (_marketContextKey == key && _marketContext is not null)
+            {
+                return _marketContext;
+            }
+            var context = await _database.GetRecentPredictionContextAsync(
+                localDate,
+                PayoutMultipliers,
+                analysisWindow,
+                cancellationToken);
+            _marketContextKey = key;
+            _marketContext = context;
+            return context;
+        }
+        finally
+        {
+            _marketContextLock.Release();
+        }
     }
 
     public async Task<AiPredictionResponseDto> GetAiPredictionAsync(
@@ -979,6 +1156,425 @@ public sealed class PredictionService
             rankedCodes[0]);
     }
 
+    private static MarketPredictionBuildResult BuildMarketSignalPrediction(
+        PredictionContextDto context,
+        IReadOnlyList<BettingSignalSnapshotDto> snapshots,
+        BettingSignalSnapshotDto current,
+        HousePerformanceDto housePerformance)
+    {
+        // This model is intentionally separate from BuildHeuristic. The old
+        // prediction remains stable while this channel learns whether HOT and
+        // crowd-coin observations have any measurable relationship to results.
+        var baseline = BuildHeuristic(context);
+        var codes = PayoutMultipliers.Keys.ToArray();
+        var baselineDistribution = baseline.Items.ToDictionary(
+            item => item.ItemCode,
+            item => Math.Max(0.000001, item.ProbabilityPercent / 100d));
+        var completed = snapshots
+            .Where(snapshot => snapshot.ResultItemCode is not null &&
+                               PayoutMultipliers.ContainsKey(snapshot.ResultItemCode))
+            .TakeLast(500)
+            .ToList();
+        var currentActivity = SignalActivity(current, codes);
+        var outcomeWeights = codes.ToDictionary(code => code, _ => 0d);
+        var outcomeSamples = codes.ToDictionary(code => code, _ => 0);
+        var effectiveSamples = 0d;
+        var matchingHotSamples = current.HotItemCode is null
+            ? []
+            : completed.Where(snapshot => snapshot.HotItemCode == current.HotItemCode).ToList();
+
+        for (var index = 0; index < completed.Count; index++)
+        {
+            var snapshot = completed[index];
+            var resultCode = snapshot.ResultItemCode!;
+            var observed = SignalActivity(snapshot, codes);
+            var similarity = codes.Average(code => 1d - Math.Min(1d, Math.Abs(
+                observed.GetValueOrDefault(code) - currentActivity.GetValueOrDefault(code)) / 100d));
+            if (current.HotItemCode is not null)
+            {
+                similarity *= snapshot.HotItemCode == current.HotItemCode ? 1.35 : 0.72;
+            }
+            var age = completed.Count - 1 - index;
+            var weight = Math.Max(0.05, similarity) * Math.Pow(0.995, age);
+            outcomeWeights[resultCode] += weight;
+            outcomeSamples[resultCode]++;
+            effectiveSamples += weight;
+        }
+
+        // Bayesian shrinkage prevents a few early HOT/coin samples from
+        // overpowering the long-running model.
+        const double priorStrength = 24d;
+        var empirical = Normalize(
+            codes.ToDictionary(
+                code => code,
+                code => outcomeWeights[code] + priorStrength * baselineDistribution[code]),
+            codes,
+            baselineDistribution);
+
+        // Learn explicit transitions such as "HOT Xiên -> Bò". A separate,
+        // strongly-shrunk conditional distribution makes that relationship
+        // visible to the model without letting a handful of rounds dominate.
+        const double hotPriorStrength = 12d;
+        var hotOutcomeCounts = codes.ToDictionary(
+            code => code,
+            code => matchingHotSamples.Count(snapshot => snapshot.ResultItemCode == code));
+        var hotConditional = Normalize(
+            codes.ToDictionary(
+                code => code,
+                code => hotOutcomeCounts[code] + hotPriorStrength * baselineDistribution[code]),
+            codes,
+            baselineDistribution);
+
+        // Exposure is only a weak, testable feature. It does not assume that a
+        // provider manipulates outcomes; historical calibration above decides
+        // whether crowd activity has predictive value.
+        var exposure = Normalize(
+            codes.ToDictionary(code => code, code =>
+            {
+                var activity = currentActivity.GetValueOrDefault(code) / 100d;
+                var liability = activity * PayoutMultipliers[code];
+                return baselineDistribution[code] / (1d + liability);
+            }),
+            codes,
+            baselineDistribution);
+
+        var evidence = 1d - Math.Exp(-effectiveSamples / 35d);
+        var empiricalWeight = Math.Min(0.30, evidence * 0.30);
+        var hotEvidence = 1d - Math.Exp(-matchingHotSamples.Count / 18d);
+        var hotWeight = current.HotItemCode is null ? 0d : Math.Min(0.22, hotEvidence * 0.22);
+        var measuredRiskBias = Math.Clamp(
+            (housePerformance.RiskAvoidanceScorePercent - 50d) / 50d,
+            0d,
+            1d);
+        var exposureWeight = Math.Min(0.14, evidence * measuredRiskBias * 0.14);
+        var baselineWeight = 1d - empiricalWeight - hotWeight - exposureWeight;
+        var combined = Normalize(
+            codes.ToDictionary(code => code, code =>
+                baselineWeight * baselineDistribution[code] +
+                empiricalWeight * empirical[code] +
+                hotWeight * hotConditional[code] +
+                exposureWeight * exposure[code]),
+            codes,
+            baselineDistribution);
+        var sideSignal = AnalyzeMarketSides(context, combined);
+        var redProbabilityBeforeSideSignal = codes
+            .Where(RedSideCodes.Contains)
+            .Sum(code => combined[code]);
+        var greenProbabilityBeforeSideSignal = 1d - redProbabilityBeforeSideSignal;
+        foreach (var code in codes)
+        {
+            combined[code] *= RedSideCodes.Contains(code)
+                ? sideSignal.RedProbability / Math.Max(0.000001, redProbabilityBeforeSideSignal)
+                : sideSignal.GreenProbability / Math.Max(0.000001, greenProbabilityBeforeSideSignal);
+        }
+        combined = Normalize(combined, codes, baselineDistribution);
+        var probabilityRankedCodes = codes.OrderByDescending(code => combined[code]).ToList();
+        var valueIndex = codes.ToDictionary(
+            code => code,
+            code => combined[code] * PayoutMultipliers[code]);
+        var rankedCodes = codes.OrderByDescending(code => valueIndex[code]).ToList();
+        var spread = combined[probabilityRankedCodes[0]] - combined[probabilityRankedCodes[1]];
+        var modelConfidence = Math.Clamp(
+            30d + 35d * evidence + Math.Min(15d, spread * 180d),
+            30d,
+            82d);
+        var maxValue = valueIndex.Values.Max();
+        var minValue = valueIndex.Values.Min();
+        var valueSpread = Math.Max(0.000001, maxValue - minValue);
+        var hotLabel = current.HotItemCode is { } hot && ItemMeta.TryGetValue(hot, out var hotMeta)
+            ? hotMeta.Name
+            : "chưa nhận diện";
+
+        var items = rankedCodes.Select(code =>
+        {
+            var relative = (valueIndex[code] - minValue) / valueSpread;
+            var activity = currentActivity.GetValueOrDefault(code);
+            var isHot = current.HotItemCode == code;
+            var liability = activity / 100d * PayoutMultipliers[code];
+            var colorSide = RedSideCodes.Contains(code) ? "Đỏ" : "Xanh";
+            var hotEvidenceNote = current.HotItemCode is null
+                ? "không có HOT hiện tại"
+                : $"HOT này đã ghi {matchingHotSamples.Count} cầu, về {ItemMeta[code].Name} {hotOutcomeCounts[code]} lần";
+            var reason = $"{(isHot ? "Đang HOT" : "Không HOT")}, thuộc bên {colorSide}, mức xu {activity:0}%, chỉ số hoàn trả kỳ vọng {valueIndex[code]:0.000}; nghĩa vụ trả thưởng tương đối {liability:0.00}. {hotEvidenceNote}; đối chiếu {outcomeSamples[code]} kết quả trong cửa sổ gần nhất.";
+            return new PredictionItemDto(
+                code,
+                ItemMeta[code].Name,
+                ItemMeta[code].Category,
+                PayoutMultipliers[code],
+                context.HistoricalCounts.GetValueOrDefault(code),
+                context.TodayCounts.GetValueOrDefault(code),
+                Math.Round(combined[code] * 100, 2),
+                Math.Round(Math.Clamp(15 + 80 * relative, 5, 99), 1),
+                outcomeSamples[code],
+                reason);
+        }).ToList();
+        var vegetableProbability = combined
+            .Where(entry => ItemMeta[entry.Key].Category == "VEGETABLE")
+            .Sum(entry => entry.Value) * 100;
+
+        var sideForecast = new MarketSideForecastDto(
+            Math.Round(codes.Where(RedSideCodes.Contains).Sum(code => combined[code]) * 100, 2),
+            Math.Round(codes.Where(code => !RedSideCodes.Contains(code)).Sum(code => combined[code]) * 100, 2),
+            sideSignal.CurrentSide,
+            sideSignal.CurrentStreak,
+            sideSignal.MatchedTransitions,
+            Math.Round(sideSignal.SignalWeight * 100, 1));
+        var prediction = new PredictionDto(
+            "market-signals-v2-color-sides",
+            context.LocalDate,
+            DateTimeOffset.UtcNow,
+            items,
+            $"Chỉ phân tích tối đa 500 cầu gần nhất. Mô hình độc lập kết hợp chuỗi kết quả, cầu Đỏ/Xanh, chuyển tiếp HOT→kết quả ({hotLabel}: {matchingHotSamples.Count} mẫu), mức xu, hệ số trả thưởng và mức độ kết quả lịch sử trùng với giả thuyết giảm nghĩa vụ nhà cái ({housePerformance.RiskAvoidanceScorePercent:0.0}%). Nhóm Đỏ gồm Cà chua, Bánh mì, Cà rốt, Bò; nhóm Xanh gồm Ngô, Cải, Xiên, Đùi. Có {sideSignal.MatchedTransitions} chuyển tiếp Đỏ/Xanh tương tự và {completed.Count} cầu ghép được tín hiệu + kết quả; cỡ mẫu HOT/xu hiệu dụng {effectiveSamples:0.0}. Trọng số chuyển tiếp HOT {hotWeight:P0}, cầu màu {sideSignal.SignalWeight:P0}, dữ liệu thị trường khác {empiricalWeight + exposureWeight:P0}. Lãi/lỗ nhà cái chỉ là đơn vị ước tính từ cấp xu quan sát, không phải tiền thật. Không bảo đảm thắng.",
+            Math.Round(modelConfidence, 1),
+            Math.Round(vegetableProbability, 2),
+            Math.Round(100 - vegetableProbability, 2),
+            rankedCodes[0]);
+        return new MarketPredictionBuildResult(prediction, sideForecast);
+    }
+
+    private static MarketSideSignal AnalyzeMarketSides(
+        PredictionContextDto context,
+        IReadOnlyDictionary<string, double> priorDistribution)
+    {
+        var segments = BuildContiguousSegments(context.History
+            .Where(item => PayoutMultipliers.ContainsKey(item.ItemCode))
+            .ToList());
+        var currentSegment = segments.LastOrDefault() ?? [];
+        var currentSides = currentSegment
+            .Select(item => RedSideCodes.Contains(item.ItemCode) ? "RED" : "GREEN")
+            .ToList();
+        var currentSide = currentSides.LastOrDefault();
+        var currentStreak = 0;
+        for (var index = currentSides.Count - 1; index >= 0 && currentSides[index] == currentSide; index--)
+        {
+            currentStreak++;
+        }
+
+        var redWeight = 0d;
+        var greenWeight = 0d;
+        var matchedTransitions = 0;
+        var maximumDepth = Math.Min(6, currentSides.Count);
+        for (var depth = maximumDepth; depth >= 1; depth--)
+        {
+            var suffix = currentSides.TakeLast(depth).ToArray();
+            foreach (var segment in segments)
+            {
+                var sides = segment
+                    .Select(item => RedSideCodes.Contains(item.ItemCode) ? "RED" : "GREEN")
+                    .ToList();
+                for (var nextIndex = depth; nextIndex < sides.Count; nextIndex++)
+                {
+                    var matches = true;
+                    for (var offset = 0; offset < depth; offset++)
+                    {
+                        if (sides[nextIndex - depth + offset] != suffix[offset])
+                        {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if (!matches) continue;
+                    var weight = depth * depth;
+                    if (sides[nextIndex] == "RED") redWeight += weight;
+                    else greenWeight += weight;
+                    matchedTransitions++;
+                }
+            }
+        }
+
+        if (currentSide is not null)
+        {
+            foreach (var segment in segments)
+            {
+                var sides = segment
+                    .Select(item => RedSideCodes.Contains(item.ItemCode) ? "RED" : "GREEN")
+                    .ToList();
+                for (var nextIndex = 1; nextIndex < sides.Count; nextIndex++)
+                {
+                    if (sides[nextIndex - 1] != currentSide) continue;
+                    var historicalStreak = 1;
+                    for (var index = nextIndex - 2; index >= 0 && sides[index] == currentSide; index--)
+                    {
+                        historicalStreak++;
+                    }
+                    var weight = 0.75 / (1d + Math.Abs(
+                        Math.Min(10, historicalStreak) - Math.Min(10, currentStreak)));
+                    if (sides[nextIndex] == "RED") redWeight += weight;
+                    else greenWeight += weight;
+                }
+            }
+        }
+
+        var priorRed = priorDistribution
+            .Where(entry => RedSideCodes.Contains(entry.Key))
+            .Sum(entry => entry.Value);
+        const double priorStrength = 16d;
+        var sampleWeight = redWeight + greenWeight;
+        var conditionalRed = (redWeight + priorStrength * priorRed) /
+            Math.Max(0.000001, sampleWeight + priorStrength);
+        var evidence = 1d - Math.Exp(-sampleWeight / 80d);
+        var signalWeight = Math.Min(0.24, evidence * 0.24);
+        var redProbability = Math.Clamp(
+            (1d - signalWeight) * priorRed + signalWeight * conditionalRed,
+            0.05,
+            0.95);
+        return new MarketSideSignal(
+            redProbability,
+            1d - redProbability,
+            currentSide,
+            currentStreak,
+            matchedTransitions,
+            signalWeight);
+    }
+
+    private static HousePerformanceDto AnalyzeHousePerformance(
+        IReadOnlyList<BettingSignalSnapshotDto> snapshots,
+        BettingSignalsDto? liveSignals)
+    {
+        var codes = PayoutMultipliers.Keys.ToArray();
+        var completed = snapshots
+            .Where(snapshot => snapshot.ResultItemCode is not null &&
+                               PayoutMultipliers.ContainsKey(snapshot.ResultItemCode))
+            .TakeLast(500)
+            .ToList();
+        var totalStake = 0d;
+        var totalPayout = 0d;
+        var houseWinningRounds = 0;
+        var houseLosingRounds = 0;
+        var hotObservedRounds = 0;
+        var hotHitRounds = 0;
+        var protectionDeltas = new List<double>();
+        var theoreticalTotal = codes.Sum(code => 1d / PayoutMultipliers[code]);
+        var theoreticalProbability = codes.ToDictionary(
+            code => code,
+            code => (1d / PayoutMultipliers[code]) / theoreticalTotal);
+
+        foreach (var snapshot in completed)
+        {
+            var coins = snapshot.Items
+                .Where(item => PayoutMultipliers.ContainsKey(item.ItemCode))
+                .GroupBy(item => item.ItemCode)
+                .ToDictionary(group => group.Key, group => Math.Max(0, group.Max(item => item.CoinCount)));
+            var stake = codes.Sum(code => coins.GetValueOrDefault(code));
+            if (stake <= 0) continue;
+            var resultCode = snapshot.ResultItemCode!;
+            var payout = coins.GetValueOrDefault(resultCode) * PayoutMultipliers[resultCode];
+            var net = stake - payout;
+            totalStake += stake;
+            totalPayout += payout;
+            if (net >= 0) houseWinningRounds++;
+            else houseLosingRounds++;
+
+            if (!string.IsNullOrWhiteSpace(snapshot.HotItemCode))
+            {
+                hotObservedRounds++;
+                if (snapshot.HotItemCode == resultCode) hotHitRounds++;
+            }
+
+            var liabilities = codes
+                .Select(code => (Code: code, Value: coins.GetValueOrDefault(code) * PayoutMultipliers[code]))
+                .OrderBy(entry => entry.Value)
+                .ToList();
+            var resultIndex = liabilities.FindIndex(entry => entry.Code == resultCode);
+            if (resultIndex >= 0)
+            {
+                var protectionByCode = liabilities
+                    .Select((entry, index) => new
+                    {
+                        entry.Code,
+                        Score = 1d - index / (double)Math.Max(1, liabilities.Count - 1)
+                    })
+                    .ToDictionary(entry => entry.Code, entry => entry.Score);
+                var observedProtection = protectionByCode[resultCode];
+                var neutralProtection = codes.Sum(code =>
+                    theoreticalProbability[code] * protectionByCode[code]);
+                protectionDeltas.Add(observedProtection - neutralProtection);
+            }
+        }
+
+        var liveCoins = liveSignals?.Items
+            .Where(item => PayoutMultipliers.ContainsKey(item.ItemCode))
+            .GroupBy(item => item.ItemCode)
+            .ToDictionary(group => group.Key, group => Math.Max(0, group.Max(item => item.CoinCount))) ?? [];
+        var liveLiabilities = codes.ToDictionary(
+            code => code,
+            code => liveCoins.GetValueOrDefault(code) * PayoutMultipliers[code]);
+        var highestLiability = liveLiabilities.OrderByDescending(entry => entry.Value).FirstOrDefault();
+        var currentStake = codes.Sum(code => (double)liveCoins.GetValueOrDefault(code));
+        var currentScenarios = codes
+            .Select(code =>
+            {
+                var coinLevel = liveCoins.GetValueOrDefault(code);
+                var payout = coinLevel * PayoutMultipliers[code];
+                return new HouseOutcomeScenarioDto(
+                    code,
+                    coinLevel,
+                    Math.Round(payout, 2),
+                    Math.Round(currentStake - payout, 2));
+            })
+            .OrderBy(scenario => scenario.EstimatedHouseNetUnits)
+            .ToList();
+        var netUnits = totalStake - totalPayout;
+
+        return new HousePerformanceDto(
+            houseWinningRounds + houseLosingRounds,
+            Math.Round(totalStake, 2),
+            Math.Round(totalPayout, 2),
+            Math.Round(netUnits, 2),
+            totalStake <= 0 ? 0 : Math.Round(netUnits * 100d / totalStake, 2),
+            houseWinningRounds,
+            houseLosingRounds,
+            hotObservedRounds,
+            hotObservedRounds == 0 ? 0 : Math.Round(hotHitRounds * 100d / hotObservedRounds, 2),
+            protectionDeltas.Count == 0
+                ? 50
+                : Math.Round(Math.Clamp(50d + 50d * protectionDeltas.Average(), 0d, 100d), 2),
+            highestLiability.Value > 0 ? highestLiability.Key : null,
+            Math.Round(highestLiability.Value, 2),
+            Math.Round(currentStake, 2),
+            currentScenarios);
+    }
+
+    private static IReadOnlyList<HotOutcomeStatDto> AnalyzeHotOutcomes(
+        IReadOnlyList<BettingSignalSnapshotDto> snapshots,
+        string? currentHotItemCode)
+    {
+        if (string.IsNullOrWhiteSpace(currentHotItemCode)) return [];
+        var matching = snapshots
+            .Where(snapshot => snapshot.HotItemCode == currentHotItemCode &&
+                               snapshot.ResultItemCode is not null &&
+                               PayoutMultipliers.ContainsKey(snapshot.ResultItemCode))
+            .TakeLast(500)
+            .ToList();
+        return PayoutMultipliers.Keys
+            .Select(code =>
+            {
+                var count = matching.Count(snapshot => snapshot.ResultItemCode == code);
+                return new HotOutcomeStatDto(
+                    currentHotItemCode,
+                    code,
+                    matching.Count,
+                    count,
+                    matching.Count == 0 ? 0 : Math.Round(count * 100d / matching.Count, 2));
+            })
+            .OrderByDescending(stat => stat.OutcomeRounds)
+            .ThenBy(stat => stat.OutcomeItemCode)
+            .ToList();
+    }
+
+    private static Dictionary<string, double> SignalActivity(
+        BettingSignalSnapshotDto? snapshot,
+        IReadOnlyList<string> codes)
+    {
+        var values = codes.ToDictionary(code => code, _ => 0d);
+        if (snapshot is null) return values;
+        foreach (var item in snapshot.Items.Where(item => values.ContainsKey(item.ItemCode)))
+        {
+            values[item.ItemCode] = Math.Clamp(item.ActivityPercent, 0, 100);
+        }
+        return values;
+    }
+
     private static List<List<PredictionHistoryItemDto>> BuildContiguousSegments(
         IReadOnlyList<PredictionHistoryItemDto> history)
     {
@@ -1059,5 +1655,17 @@ public sealed class PredictionService
             code => code,
             code => Math.Max(0, values.GetValueOrDefault(code)) / total);
     }
+
+    private sealed record MarketPredictionBuildResult(
+        PredictionDto Prediction,
+        MarketSideForecastDto SideForecast);
+
+    private sealed record MarketSideSignal(
+        double RedProbability,
+        double GreenProbability,
+        string? CurrentSide,
+        int CurrentStreak,
+        int MatchedTransitions,
+        double SignalWeight);
 
 }

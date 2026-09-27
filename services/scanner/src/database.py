@@ -46,6 +46,17 @@ CREATE TABLE IF NOT EXISTS scanner_state (
     updated_at_utc TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS betting_signal_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_serial TEXT NOT NULL,
+    round_local_date TEXT NOT NULL,
+    round_number INTEGER NOT NULL,
+    observed_at_utc TEXT NOT NULL,
+    hot_item_code TEXT,
+    items_json TEXT NOT NULL,
+    UNIQUE(source_serial, round_local_date, round_number)
+);
+
 CREATE TABLE IF NOT EXISTS alert_deliveries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     alert_key TEXT NOT NULL UNIQUE,
@@ -72,6 +83,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_results_source_round
     WHERE round_number IS NOT NULL AND round_local_date IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_scanner_events_occurred_at
     ON scanner_events(occurred_at_utc DESC);
+CREATE INDEX IF NOT EXISTS ix_betting_signal_snapshots_round
+    ON betting_signal_snapshots(round_local_date DESC, round_number DESC);
+CREATE INDEX IF NOT EXISTS ix_betting_signal_snapshots_observed
+    ON betting_signal_snapshots(observed_at_utc DESC, id DESC);
 """
 
 
@@ -174,6 +189,81 @@ class ScannerDatabase:
                 "SELECT state_value FROM scanner_state WHERE state_key=?", (key,)
             ).fetchone()
             return str(row[0]) if row else None
+
+    def upsert_betting_signal_snapshot(
+        self,
+        source_serial: str,
+        round_local_date: str,
+        round_number: int,
+        observed_at_utc: str,
+        hot_item_code: Optional[str],
+        items: list[dict[str, object]],
+    ) -> None:
+        """Persist the strongest live HOT/coin observation for one betting round."""
+        if round_number <= 0:
+            return
+        with self.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT hot_item_code, items_json
+                FROM betting_signal_snapshots
+                WHERE source_serial=? AND round_local_date=? AND round_number=?
+                """,
+                (source_serial, round_local_date, round_number),
+            ).fetchone()
+            strongest_by_code: dict[str, dict[str, object]] = {}
+            if existing:
+                try:
+                    for item in json.loads(str(existing["items_json"])):
+                        code = str(item.get("itemCode", ""))
+                        if code:
+                            strongest_by_code[code] = dict(item)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    strongest_by_code = {}
+            for item in items:
+                code = str(item.get("itemCode", ""))
+                if not code:
+                    continue
+                previous = strongest_by_code.get(code, {})
+                strongest_by_code[code] = {
+                    **previous,
+                    **item,
+                    "itemCode": code,
+                    "coinCount": max(
+                        int(previous.get("coinCount", 0)),
+                        int(item.get("coinCount", 0)),
+                    ),
+                    "activityPercent": max(
+                        int(previous.get("activityPercent", 0)),
+                        int(item.get("activityPercent", 0)),
+                    ),
+                }
+            strongest_items = list(strongest_by_code.values())
+            strongest_hot = hot_item_code or (
+                str(existing["hot_item_code"])
+                if existing and existing["hot_item_code"] is not None
+                else None
+            )
+            connection.execute(
+                """
+                INSERT INTO betting_signal_snapshots(
+                    source_serial, round_local_date, round_number,
+                    observed_at_utc, hot_item_code, items_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_serial, round_local_date, round_number) DO UPDATE SET
+                    observed_at_utc=excluded.observed_at_utc,
+                    hot_item_code=excluded.hot_item_code,
+                    items_json=excluded.items_json
+                """,
+                (
+                    source_serial,
+                    round_local_date,
+                    round_number,
+                    observed_at_utc,
+                    strongest_hot,
+                    json.dumps(strongest_items, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
 
     def insert_result(
         self,

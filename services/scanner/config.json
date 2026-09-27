@@ -14,9 +14,11 @@
     "post_popup_fast_window_seconds": 8,
     "round_interval_seconds": 40,
     "max_failed_attempts": 4,
+    "no_result_alert_after_attempts": 10,
     "failure_alert_cooldown_seconds": 30,
     "save_result_crops": true,
-    "max_error_captures": 100
+    "max_error_captures": 100,
+    "capture_retention_days": 2
   },
   "popup_dismiss": {
     "enabled": true,
@@ -59,7 +61,8 @@
     "maximum": 999999,
     "timezone": "Asia/Bangkok",
     "day_boundary_hour": 23,
-    "scan_interval_seconds": 2.0
+    "scan_interval_seconds": 2.0,
+    "reanchor_confirmations": 3
   },
   "countdown": {
     "reference_width": 720,
@@ -71,6 +74,17 @@
     "scan_interval_seconds": 0.75,
     "white_value_min": 175,
     "white_saturation_max": 100
+  },
+  "financials": {
+    "enabled": false,
+    "scan_interval_seconds": 1.0,
+    "reference_width": 720,
+    "reference_height": 1500,
+    "scale_mode": "width",
+    "anchor_y": "top",
+    "tesseract_path": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "balance_crop": {"x": 220, "y": 1128, "width": 165, "height": 48},
+    "items": []
   },
   "betting_signals": {
     "enabled": true,

@@ -32,10 +32,12 @@
     "post_popup_fast_window_seconds": 8,
     "round_interval_seconds": 40,
     "max_failed_attempts": 4,
+    "no_result_alert_after_attempts": 10,
     "failure_alert_cooldown_seconds": 30,
     "reconnect_alert_after_attempts": 5,
     "save_result_crops": true,
-    "max_error_captures": 100
+    "max_error_captures": 100,
+    "capture_retention_days": 2
   },
   "popup_dismiss": {
     "enabled": false,
@@ -121,6 +123,7 @@
     "timezone": "Asia/Bangkok",
     "day_boundary_hour": 23,
     "scan_interval_seconds": 2.0,
+    "reanchor_confirmations": 3,
     "scale_mode": "width",
     "anchor_y": "top"
   },

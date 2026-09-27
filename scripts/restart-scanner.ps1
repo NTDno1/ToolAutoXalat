@@ -10,12 +10,14 @@ $runtimeDir = Join-Path $projectRoot 'runtime'
 $logDir = Join-Path $runtimeDir 'logs'
 $statePath = Join-Path $runtimeDir 'processes.json'
 $scannerPath = Join-Path $scannerDir 'scanner.py'
+$scannerStatusScript = Join-Path $PSScriptRoot 'read-scanner-status.py'
 $taskName = 'ToolAutoXalat-Scanner'
 $pythonPath = (Get-Command python -ErrorAction Stop).Source
 if (-not $ConfigPath) { $ConfigPath = Join-Path $scannerDir 'config.json' }
 $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $scannerConfig = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $scannerArguments = '"{0}" --config "{1}"' -f $scannerPath, $ConfigPath
+$databasePath = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $ConfigPath) $scannerConfig.paths.database))
 if ($scannerConfig.source.type -eq 'adb') {
     # Validate capture and geometry before stopping a working scanner.
     $checkDir = Join-Path $runtimeDir 'scanner-preflight'
@@ -111,14 +113,23 @@ do {
         } |
         Select-Object -First 1
     try {
-        $status = Invoke-RestMethod -Uri ($scannerConfig.backend.base_url.TrimEnd('/') + '/api/scanner/status') -TimeoutSec 2
+        # Read the scanner-owned heartbeat directly. The HTTP status endpoint
+        # requires an authenticated browser session and returns 401 to this
+        # local maintenance script even when the scanner is healthy.
+        $statusJson = & $pythonPath $scannerStatusScript $databasePath 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $statusJson) {
+            throw 'Could not read scanner heartbeat from SQLite.'
+        }
+        $status = $statusJson | ConvertFrom-Json
         $heartbeatIsCurrent = $false
         if ($scanner -and $status.lastHeartbeatUtc) {
             $heartbeatUtc = [DateTimeOffset]::Parse($status.lastHeartbeatUtc).UtcDateTime
             $processStartedUtc = ([DateTime]$scanner.CreationDate).ToUniversalTime()
-            $heartbeatIsCurrent = $heartbeatUtc -ge $processStartedUtc.AddSeconds(-1)
+            $heartbeatAgeSeconds = ([DateTime]::UtcNow - $heartbeatUtc).TotalSeconds
+            $heartbeatIsCurrent = $heartbeatUtc -ge $processStartedUtc.AddSeconds(-1) -and `
+                $heartbeatAgeSeconds -le 10
         }
-        $online = $scanner -and $status.isOnline -and $heartbeatIsCurrent -and `
+        $online = $scanner -and $status.status -eq 'RUNNING' -and $heartbeatIsCurrent -and `
             $status.sourceSerial -eq $expectedSourceSerial
     } catch { $online = $false }
     if (-not $online) { Start-Sleep -Milliseconds 500 }

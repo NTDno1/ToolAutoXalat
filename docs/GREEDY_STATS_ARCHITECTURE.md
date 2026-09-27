@@ -91,6 +91,38 @@ Với cảnh báo bệt, `data` có thêm `deliveryMode: "BROADCAST"`, `recipien
 `alert` và `recipients`. Dịch vụ webhook chung chịu trách nhiệm phát đồng loạt;
 backend không gọi riêng từng số.
 
+Ví dụ payload gửi sang n8n:
+
+```json
+{
+  "schemaVersion": "1.0",
+  "source": "ToolAutoXalat",
+  "notificationId": "MEAT_STREAK_3:17321",
+  "type": "STREAK_ALERT",
+  "eventCode": "MEAT_STREAK_3",
+  "severity": "WARNING",
+  "title": "Bệt Thịt đạt 3 cầu",
+  "message": "Đã xuất hiện 3 kết quả Thịt liên tục.",
+  "occurredAtUtc": "2026-09-13T17:00:00Z",
+  "data": {
+    "deliveryMode": "BROADCAST",
+    "recipientCount": 0,
+    "alert": {
+      "category": "MEAT",
+      "streakLength": 3,
+      "threshold": 3,
+      "roundNumber": 95,
+      "itemCode": "BO",
+      "itemName": "Bò"
+    },
+    "recipients": []
+  }
+}
+```
+
+n8n có thể rẽ nhánh bằng `{{$json.type}}` hoặc `{{$json.eventCode}}`; ví dụ
+`STREAK_ALERT` là cảnh báo bệt, còn `SCANNER_SYSTEM_EVENT` là lỗi scanner/kết nối.
+
 ### Thanh toán đăng ký
 
 Màn thanh toán được mở ngay sau khi đăng ký số điện thoại. Cấu hình QR công khai

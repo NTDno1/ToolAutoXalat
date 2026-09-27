@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import gc
 from concurrent.futures import Future, ThreadPoolExecutor
+import ctypes
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -43,6 +47,11 @@ from detector import (  # noqa: E402
     ITEMS,
     PopupResultDetection,
     find_sequence_shift,
+)
+from financial_detector import (  # noqa: E402
+    FinancialDetection,
+    FinancialDetectionError,
+    FinancialDetector,
 )
 from popup_detector import is_result_popup  # noqa: E402
 from round_detector import RoundDetection, RoundDetectionError, RoundDetector  # noqa: E402
@@ -165,6 +174,8 @@ class GreedyScanner:
         self.template_dir = self._resolve(paths["templates"])
         self.capture_dir = self._resolve(paths["captures"])
         self.log_dir = self._resolve(paths["logs"])
+        self.live_frame_path = self._resolve(paths["live_frame"]) if paths.get("live_frame") else None
+        self.last_live_frame_write_monotonic = 0.0
         self.capture_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -188,6 +199,9 @@ class GreedyScanner:
         self.active_round: Optional[int] = None
         self.active_round_observed_at: Optional[datetime] = None
         self.active_round_date: Optional[str] = None
+        self.round_reanchor_candidate: Optional[int] = None
+        self.round_reanchor_candidate_date: Optional[str] = None
+        self.round_reanchor_confirmations = 0
         self.countdown_detector = CountdownDetector(self.config["countdown"])
         self.countdown_scan_interval = max(
             0.5, float(self.config["countdown"].get("scan_interval_seconds", 0.75))
@@ -200,6 +214,19 @@ class GreedyScanner:
         self.last_countdown_submit_monotonic = 0.0
         self.last_countdown_seconds: Optional[int] = None
         self.last_countdown_observed_at: Optional[datetime] = None
+        financial_config = self.config.get("financials", {})
+        self.financial_detector = FinancialDetector(financial_config)
+        self.financial_scan_interval = max(
+            0.5, float(financial_config.get("scan_interval_seconds", 1.0))
+        )
+        self.financial_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="financial-ocr"
+        )
+        self.financial_future: Optional[Future[FinancialDetection]] = None
+        self.financial_future_frame: Optional[np.ndarray] = None
+        self.last_financial_balance: Optional[int] = None
+        self.financial_future_observed_at: Optional[datetime] = None
+        self.last_financial_submit_monotonic = 0.0
         betting_config = self.config.get("betting_signals", {})
         self.betting_signal_detector = BettingSignalDetector(betting_config)
         self.betting_signal_scan_interval = max(
@@ -215,6 +242,9 @@ class GreedyScanner:
         )
         self.round_day_boundary_hour = max(
             0, min(23, int(self.config["round"].get("day_boundary_hour", 23)))
+        )
+        self.round_reanchor_required = max(
+            2, int(self.config["round"].get("reanchor_confirmations", 3))
         )
 
         scanner = self.config["scanner"]
@@ -235,6 +265,14 @@ class GreedyScanner:
         )
         self.round_interval = float(scanner["round_interval_seconds"])
         self.max_failed_attempts = int(scanner["max_failed_attempts"])
+        self.no_result_alert_after_attempts = max(
+            1,
+            int(
+                scanner.get(
+                    "no_result_alert_after_attempts", self.max_failed_attempts
+                )
+            ),
+        )
         self.failure_cooldown = float(scanner["failure_alert_cooldown_seconds"])
         self.reconnect_alert_after = max(
             1, int(scanner.get("reconnect_alert_after_attempts", 5))
@@ -243,6 +281,26 @@ class GreedyScanner:
         self.max_error_captures = max(
             0, int(scanner.get("max_error_captures", 100))
         )
+        self.capture_retention_days = max(
+            1, int(scanner.get("capture_retention_days", 2))
+        )
+        self.last_capture_prune_monotonic = 0.0
+        self.memory_watchdog_enabled = bool(
+            scanner.get("memory_watchdog_enabled", True)
+        )
+        self.memory_check_interval = max(
+            5.0, float(scanner.get("memory_check_interval_seconds", 30))
+        )
+        self.memory_warning_mb = max(
+            256.0, float(scanner.get("memory_warning_mb", 1500))
+        )
+        self.memory_restart_mb = max(
+            self.memory_warning_mb + 256.0,
+            float(scanner.get("memory_restart_mb", 3000)),
+        )
+        self.memory_trim_enabled = bool(scanner.get("memory_trim_enabled", True))
+        self.last_memory_check_monotonic = 0.0
+        self.memory_warning_sent = False
 
         popup = self.config.get("popup_dismiss", {})
         self.popup_dismiss_config = popup
@@ -296,6 +354,7 @@ class GreedyScanner:
         self.round_failures = 0
         self.no_result_attempts = 0
         self.last_alert_at: dict[str, datetime] = {}
+        self._prune_result_capture_directories(force=True)
 
     def _accept_countdown(self, seconds: int, observed_at: datetime) -> bool:
         previous = self.last_countdown_seconds
@@ -348,6 +407,55 @@ class GreedyScanner:
             self.countdown_detector.detect, frame.copy()
         )
 
+    def _collect_financial_detection(self) -> None:
+        future = getattr(self, "financial_future", None)
+        if future is None or not future.done():
+            return
+        observed_at = self.financial_future_observed_at or utc_now()
+        observed_frame = self.financial_future_frame
+        self.financial_future = None
+        self.financial_future_frame = None
+        self.financial_future_observed_at = None
+        try:
+            detection = future.result()
+        except (FinancialDetectionError, OSError, RuntimeError):
+            return
+        if (self.live_frame_path is not None and observed_frame is not None and
+                self.last_financial_balance is not None and
+                detection.balance_units != self.last_financial_balance):
+            evidence = self.log_dir / (
+                f"balance_{self.last_financial_balance}_to_{detection.balance_units}_"
+                f"{observed_at.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.png"
+            )
+            cv2.imwrite(str(evidence), observed_frame)
+        self.last_financial_balance = detection.balance_units
+        payload = {
+            "observedAtUtc": observed_at.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"
+            ),
+            "balanceUnits": detection.balance_units,
+            "ownBets": detection.own_bets,
+        }
+        self.database.set_state(
+            "scanner_financials",
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _schedule_financial_detection(self, frame: np.ndarray) -> None:
+        self._collect_financial_detection()
+        detector = getattr(self, "financial_detector", None)
+        if detector is None or not detector.enabled or getattr(self, "financial_future", None) is not None:
+            return
+        now = time.monotonic()
+        if now - self.last_financial_submit_monotonic < self.financial_scan_interval:
+            return
+        self.last_financial_submit_monotonic = now
+        self.financial_future_observed_at = utc_now()
+        self.financial_future_frame = frame.copy() if self.live_frame_path is not None else None
+        self.financial_future = self.financial_executor.submit(
+            detector.detect, frame.copy()
+        )
+
     def _update_betting_signals(self, frame: np.ndarray) -> None:
         if not self.betting_signal_detector.enabled:
             return
@@ -392,48 +500,203 @@ class GreedyScanner:
         observed_utc = utc_now().isoformat(timespec="milliseconds").replace(
             "+00:00", "Z"
         )
+        signal_items = [
+            {
+                "itemCode": item.item_code,
+                "coinCount": self.betting_signal_coin_max.get(item.item_code, 0),
+                "activityPercent": round(
+                    self.betting_signal_coin_max.get(item.item_code, 0)
+                    * 100
+                    / self.betting_signal_detector.max_coins
+                ),
+            }
+            for item in detection.items
+        ]
         payload = {
             "round": self.betting_signal_round,
             "observedAtUtc": observed_utc,
             "countdownSeconds": seconds,
             "hotItemCode": self.betting_signal_hot,
-            "items": [
-                {
-                    "itemCode": item.item_code,
-                    "coinCount": self.betting_signal_coin_max.get(item.item_code, 0),
-                    "activityPercent": round(
-                        self.betting_signal_coin_max.get(item.item_code, 0)
-                        * 100
-                        / self.betting_signal_detector.max_coins
-                    ),
-                }
-                for item in detection.items
-            ],
+            "items": signal_items,
         }
         self.database.set_state(
             "scanner_betting_signals",
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
+        if self.betting_signal_round is not None:
+            self.database.upsert_betting_signal_snapshot(
+                self.frame_source.serial,
+                self._local_date(),
+                self.betting_signal_round,
+                observed_utc,
+                self.betting_signal_hot,
+                signal_items,
+            )
 
     def _publish_active_round(self, number: int, observed_at: datetime) -> bool:
         local_date = self._local_date()
-        if (
-            self.active_round is not None
-            and self.active_round_date == local_date
-            and number < self.active_round
+        reference_round = self.active_round
+        reference_observed_at = self.active_round_observed_at
+        reference_date = self.active_round_date
+        # Prefer the latest completed round for this business date. A single
+        # bad asynchronous OCR read must not become the permanent reference.
+        if self.current_round is not None and self.current_round_date == local_date and (
+            reference_round is None
+            or reference_date != local_date
+            or self.current_round > reference_round
         ):
+            reference_round = self.current_round
+            reference_observed_at = self.last_result_at
+            reference_date = self.current_round_date
+        maximum_plausible = self._maximum_plausible_round(observed_at)
+        if number > maximum_plausible:
+            self.logger.warning(
+                "ROUND OCR rejected as impossible for current day: detected=%s maximum=%s",
+                number,
+                maximum_plausible,
+            )
             return False
+
+        corrupt_reference = (
+            reference_round is not None
+            and reference_date == local_date
+            and reference_round > maximum_plausible
+        )
+        return self._accept_published_round(
+            number,
+            observed_at,
+            local_date,
+            reference_round,
+            reference_observed_at,
+            reference_date,
+            maximum_plausible,
+            corrupt_reference,
+        )
+
+    def _maximum_plausible_round(self, observed_at: datetime) -> int:
+        maximum_configured = getattr(
+            getattr(self, "round_detector", None), "maximum", 999999
+        )
+        local_observed = observed_at.astimezone(self.local_timezone)
+        boundary = local_observed.replace(
+            hour=self.round_day_boundary_hour, minute=0, second=0, microsecond=0
+        )
+        if local_observed < boundary:
+            boundary -= timedelta(days=1)
+        # Round 1 starts at the configured 23:00 boundary. The small allowance
+        # covers clock drift and temporary changes in the game's round duration.
+        maximum_for_time = max(
+            30,
+            int((local_observed - boundary).total_seconds() / max(1.0, self.round_interval))
+            + 30,
+        )
+        return min(maximum_configured, maximum_for_time)
+
+    def _accept_published_round(
+        self,
+        number: int,
+        observed_at: datetime,
+        local_date: str,
+        reference_round: Optional[int],
+        reference_observed_at: Optional[datetime],
+        reference_date: Optional[str],
+        maximum_plausible: int,
+        corrupt_reference: bool,
+    ) -> bool:
         if (
-            self.active_round is not None
-            and self.active_round_observed_at is not None
-            and self.active_round_date == local_date
+            reference_round is not None
+            and reference_date == local_date
+            and number < reference_round
+            and not corrupt_reference
+        ):
+            self.round_reanchor_candidate = None
+            self.round_reanchor_candidate_date = None
+            self.round_reanchor_confirmations = 0
+            self.logger.warning(
+                "ROUND OCR rejected as regression: detected=%s reference=%s",
+                number,
+                reference_round,
+            )
+            return False
+        if corrupt_reference:
+            previous_candidate = getattr(self, "round_reanchor_candidate", None)
+            candidate_date = getattr(self, "round_reanchor_candidate_date", None)
+            if (
+                previous_candidate is not None
+                and candidate_date == local_date
+                and 0 <= number - previous_candidate <= 1
+            ):
+                self.round_reanchor_confirmations += 1
+                self.round_reanchor_candidate = number
+            else:
+                self.round_reanchor_candidate = number
+                self.round_reanchor_candidate_date = local_date
+                self.round_reanchor_confirmations = 1
+            required = getattr(self, "round_reanchor_required", 3)
+            if self.round_reanchor_confirmations < required:
+                self.logger.warning(
+                    "ROUND OCR repairing impossible reference: detected=%s reference=%s "
+                    "confirmations=%s/%s",
+                    number,
+                    reference_round,
+                    self.round_reanchor_confirmations,
+                    required,
+                )
+                return False
+            self.logger.warning(
+                "ROUND OCR repaired impossible reference: detected=%s reference=%s",
+                number,
+                reference_round,
+            )
+        if (
+            reference_round is not None
+            and reference_observed_at is not None
+            and reference_date == local_date
         ):
             elapsed = max(
-                0.0, (observed_at - self.active_round_observed_at).total_seconds()
+                0.0, (observed_at - reference_observed_at).total_seconds()
             )
             maximum_step = max(2, int(elapsed / max(1.0, self.round_interval)) + 2)
-            if number - self.active_round > maximum_step:
-                return False
+            if number - reference_round > maximum_step:
+                previous_candidate = getattr(self, "round_reanchor_candidate", None)
+                candidate_date = getattr(self, "round_reanchor_candidate_date", None)
+                if (
+                    previous_candidate is not None
+                    and candidate_date == local_date
+                    and 0 <= number - previous_candidate <= 1
+                ):
+                    self.round_reanchor_confirmations = (
+                        getattr(self, "round_reanchor_confirmations", 0) + 1
+                    )
+                    self.round_reanchor_candidate = number
+                else:
+                    self.round_reanchor_candidate = number
+                    self.round_reanchor_candidate_date = local_date
+                    self.round_reanchor_confirmations = 1
+
+                required = getattr(self, "round_reanchor_required", 3)
+                if self.round_reanchor_confirmations < required:
+                    self.logger.warning(
+                        "ROUND OCR jump awaiting confirmation: detected=%s "
+                        "reference=%s max_step=%s confirmations=%s/%s",
+                        number,
+                        reference_round,
+                        maximum_step,
+                        self.round_reanchor_confirmations,
+                        required,
+                    )
+                    return False
+                self.logger.warning(
+                    "ROUND OCR re-anchored after stable jump: detected=%s "
+                    "reference=%s confirmations=%s",
+                    number,
+                    reference_round,
+                    self.round_reanchor_confirmations,
+                )
+
+        self.round_reanchor_candidate = None
+        self.round_reanchor_candidate_date = None
+        self.round_reanchor_confirmations = 0
 
         changed = number != self.active_round or local_date != self.active_round_date
         self.active_round = number
@@ -453,6 +716,7 @@ class GreedyScanner:
                 self.current_round_date != local_date
                 or self.current_round is None
                 or number > self.current_round
+                or corrupt_reference
             )
         ):
             # Outside a result popup the app label is the latest completed
@@ -509,8 +773,8 @@ class GreedyScanner:
 
         observed_round = self._read_round(frame)
         if observed_round is not None:
-            self._publish_active_round(observed_round, utc_now())
-            return observed_round
+            if self._publish_active_round(observed_round, utc_now()):
+                return observed_round
         if self.current_round is not None and self.current_round_date == local_date:
             return self.current_round + 1
         return None
@@ -832,23 +1096,48 @@ class GreedyScanner:
         local_date: str,
         observed_round: Optional[int] = None,
     ) -> list[Optional[int]]:
-        end_round = observed_round
+        observed_at = utc_now()
+        maximum_plausible = self._maximum_plausible_round(observed_at)
+        end_round = (
+            observed_round
+            if observed_round is not None
+            and shift <= observed_round <= maximum_plausible
+            else None
+        )
+        if observed_round is not None and end_round is None:
+            self.logger.warning(
+                "ROUND recovery anchor rejected as impossible: detected=%s maximum=%s",
+                observed_round,
+                maximum_plausible,
+            )
         if (
             end_round is None
             and self.active_round is not None
             and self.active_round_date == local_date
             and self.active_round_observed_at is not None
-            and (utc_now() - self.active_round_observed_at).total_seconds()
+            and (observed_at - self.active_round_observed_at).total_seconds()
             <= self.round_interval + 5
+            and shift <= self.active_round <= maximum_plausible
         ):
             # The app label names the round whose result is currently being
             # revealed. Prefer that OCR value over inferred +1 arithmetic so
             # a previously missed detection cannot keep all later rounds off.
             end_round = self.active_round
         if end_round is None and self.current_round_date == local_date:
-            end_round = (
+            inferred_end_round = (
                 self.current_round + shift if self.current_round is not None else None
             )
+            if (
+                inferred_end_round is not None
+                and shift <= inferred_end_round <= maximum_plausible
+            ):
+                end_round = inferred_end_round
+            elif inferred_end_round is not None:
+                self.logger.warning(
+                    "ROUND recovery reference rejected as impossible: inferred=%s maximum=%s",
+                    inferred_end_round,
+                    maximum_plausible,
+                )
         if end_round is None or end_round < shift:
             return [None] * shift
         return list(range(end_round - shift + 1, end_round + 1))
@@ -867,6 +1156,42 @@ class GreedyScanner:
             except OSError as exc:
                 self.logger.warning("Could not prune debug capture %s: %s", path, exc)
 
+    def _prune_result_capture_directories(self, force: bool = False) -> None:
+        now_monotonic = time.monotonic()
+        if (
+            not force
+            and now_monotonic - self.last_capture_prune_monotonic < 3600
+        ):
+            return
+        self.last_capture_prune_monotonic = now_monotonic
+        cutoff = utc_now().date() - timedelta(days=self.capture_retention_days - 1)
+        removed = 0
+        try:
+            entries = list(self.capture_dir.iterdir())
+        except OSError as exc:
+            self.logger.warning("Could not inspect result captures: %s", exc)
+            return
+        for path in entries:
+            if not path.is_dir():
+                continue
+            try:
+                capture_date = datetime.strptime(path.name, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if capture_date >= cutoff:
+                continue
+            try:
+                shutil.rmtree(path)
+                removed += 1
+            except OSError as exc:
+                self.logger.warning("Could not prune result capture directory %s: %s", path, exc)
+        if removed:
+            self.logger.info(
+                "Pruned %d result capture directories older than %s",
+                removed,
+                cutoff.isoformat(),
+            )
+
     def _save_debug_frame(self, frame: Optional[np.ndarray], prefix: str) -> Optional[str]:
         if frame is None or self.max_error_captures <= 0:
             return None
@@ -878,6 +1203,23 @@ class GreedyScanner:
             return None
         self._prune_error_captures()
         return str(path)
+
+    def _publish_live_frame(self, frame: np.ndarray) -> None:
+        if self.live_frame_path is None:
+            return
+        now = time.monotonic()
+        if now - self.last_live_frame_write_monotonic < 0.4:
+            return
+        self.last_live_frame_write_monotonic = now
+        try:
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+            if not ok:
+                return
+            temp_path = self.live_frame_path.with_suffix(".jpg.tmp")
+            temp_path.write_bytes(encoded.tobytes())
+            os.replace(temp_path, self.live_frame_path)
+        except OSError as exc:
+            self.logger.warning("Could not publish live frame: %s", exc)
 
     def _send_backend_event(self, event_id: int, payload: dict) -> None:
         try:
@@ -971,6 +1313,133 @@ class GreedyScanner:
         self.connection_failures = 0
         self.connection_alert_sent = False
 
+    def _private_memory_mb(self) -> Optional[float]:
+        if os.name != "nt":
+            return None
+
+        class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS_EX()
+        counters.cb = ctypes.sizeof(counters)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+            handle,
+            ctypes.byref(counters),
+            counters.cb,
+        )
+        if not ok:
+            return None
+        return float(counters.PrivateUsage) / 1024 / 1024
+
+    def _trim_process_memory(self) -> None:
+        gc.collect()
+        if os.name != "nt" or not self.memory_trim_enabled:
+            return
+        try:
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.psapi.EmptyWorkingSet(handle)
+        except Exception as exc:  # pragma: no cover - best-effort Windows trim
+            self.logger.debug("Memory trim skipped: %s", exc)
+
+    def _update_runtime_scanner_pid(self, pid: int) -> None:
+        state_path = PROJECT_DIR.parent.parent / "runtime" / "processes.json"
+        try:
+            if not state_path.is_file():
+                return
+            state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+            state["scannerPid"] = pid
+            state["scannerRestartedAt"] = utc_now().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            state_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=4),
+                encoding="utf-8",
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            self.logger.warning("Could not update runtime scanner PID: %s", exc)
+
+    def _restart_for_memory(self, private_mb: float) -> None:
+        source_key = f"scanner:SCANNER_MEMORY_RESTART:{utc_now().strftime('%Y%m%d%H%M%S')}"
+        event_id = self.database.insert_event(
+            "WARNING",
+            "SCANNER_MEMORY_RESTART",
+            "Scanner tự khởi động lại vì RAM tăng quá ngưỡng",
+            {
+                "privateMemoryMb": round(private_mb, 1),
+                "restartThresholdMb": self.memory_restart_mb,
+                "argv": sys.argv,
+            },
+            source_key=source_key,
+        )
+        self._send_backend_event(
+            event_id,
+            {
+                "severity": "WARNING",
+                "eventCode": "SCANNER_MEMORY_RESTART",
+                "message": "Scanner tự khởi động lại vì RAM tăng quá ngưỡng",
+                "details": {
+                    "privateMemoryMb": round(private_mb, 1),
+                    "restartThresholdMb": self.memory_restart_mb,
+                },
+                "sourceKey": source_key,
+                "occurredAtUtc": utc_now().isoformat().replace("+00:00", "Z"),
+            },
+        )
+        command = [sys.executable, *sys.argv]
+        process = subprocess.Popen(
+            command,
+            cwd=str(PROJECT_DIR),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            close_fds=True,
+        )
+        self._update_runtime_scanner_pid(process.pid)
+        self.logger.warning(
+            "Scanner memory %.1f MB exceeded %.1f MB; spawned replacement PID %s",
+            private_mb,
+            self.memory_restart_mb,
+            process.pid,
+        )
+        self.stop_requested = True
+
+    def _check_memory_watchdog(self) -> None:
+        if not self.memory_watchdog_enabled:
+            return
+        now = time.monotonic()
+        if now - self.last_memory_check_monotonic < self.memory_check_interval:
+            return
+        self.last_memory_check_monotonic = now
+        self._trim_process_memory()
+        private_mb = self._private_memory_mb()
+        if private_mb is None:
+            return
+        if private_mb >= self.memory_restart_mb:
+            self._restart_for_memory(private_mb)
+            return
+        if private_mb >= self.memory_warning_mb and not self.memory_warning_sent:
+            self.memory_warning_sent = True
+            self._notify_failure(
+                "SCANNER_MEMORY_HIGH",
+                "Scanner đang dùng RAM cao",
+                {
+                    "privateMemoryMb": round(private_mb, 1),
+                    "warningThresholdMb": self.memory_warning_mb,
+                    "restartThresholdMb": self.memory_restart_mb,
+                },
+            )
+        elif private_mb < self.memory_warning_mb * 0.75:
+            self.memory_warning_sent = False
+
     def _save_result_crop(
         self,
         frame: np.ndarray,
@@ -979,6 +1448,7 @@ class GreedyScanner:
     ) -> Optional[str]:
         if not self.save_result_crops:
             return None
+        self._prune_result_capture_directories()
         day_dir = self.capture_dir / utc_now().strftime("%Y-%m-%d")
         day_dir.mkdir(parents=True, exist_ok=True)
         path = day_dir / f"result_{result_id:08d}.png"
@@ -1153,6 +1623,7 @@ class GreedyScanner:
             )
 
         if self.save_result_crops:
+            self._prune_result_capture_directories()
             day_dir = self.capture_dir / utc_now().strftime("%Y-%m-%d")
             day_dir.mkdir(parents=True, exist_ok=True)
             verification_path = (
@@ -1280,8 +1751,10 @@ class GreedyScanner:
                     )
                     self.no_result_attempts = 0
                 elif (
-                    self.no_result_attempts >= self.max_failed_attempts
-                    and elapsed >= self.round_interval + self.max_failed_attempts * self.scan_interval
+                    self.no_result_attempts >= self.no_result_alert_after_attempts
+                    and elapsed
+                    >= self.round_interval
+                    + self.no_result_alert_after_attempts * self.scan_interval
                     and time.monotonic()
                     - max(
                         self.last_popup_seen_monotonic,
@@ -1291,7 +1764,7 @@ class GreedyScanner:
                 ):
                     self._notify_failure(
                         "RESULT_TIMEOUT",
-                        "Quá 4 lần quét sau thời điểm dự kiến nhưng chưa thấy kèo mới",
+                        f"Quá {self.no_result_alert_after_attempts} lần quét sau thời điểm dự kiến nhưng chưa thấy kèo mới",
                         {
                             "attempts": self.no_result_attempts,
                             "elapsedSeconds": round(elapsed, 1),
@@ -1336,14 +1809,17 @@ class GreedyScanner:
     def scan_once(self) -> dict:
         self._collect_countdown_detection()
         self._collect_round_detection()
+        self._collect_financial_detection()
         frame: Optional[np.ndarray] = None
         try:
             frame = self.frame_source.capture()
             self._record_connection_restored()
+            self._publish_live_frame(frame)
             # OCR runs on its own worker so reading the on-screen 30-second
             # timer never delays history matching or result persistence.
             self._schedule_countdown_detection(frame)
             self._schedule_round_detection(frame)
+            self._schedule_financial_detection(frame)
             # The popup exposes the winning icon about five seconds before the
             # persistent history strip shifts. Detect and publish it directly.
             if is_result_popup(frame, self.popup_dismiss_config):
@@ -1395,8 +1871,7 @@ class GreedyScanner:
         if self.previous_sequence is None:
             observed_round = self._read_round(frame)
             if observed_round is not None:
-                self.current_round = observed_round
-                self.current_round_date = local_date
+                self._publish_active_round(observed_round, utc_now())
             self.previous_sequence = sequence
             self.last_result_at = utc_now()
             self.first_successful_scan = False
@@ -1421,18 +1896,27 @@ class GreedyScanner:
                 round_numbers = self._rounds_for_shift(
                     startup_shift, local_date, observed_round
                 )
-                for code, round_number in zip(
-                    reversed(sequence[:startup_shift]), round_numbers
-                ):
-                    self._record_result(
-                        code,
-                        detection,
-                        frame,
-                        f"startup_recovered_shift_{startup_shift}",
-                        round_number,
-                        local_date,
+                if any(round_number is None for round_number in round_numbers):
+                    self.logger.warning(
+                        "Startup sequence shift ignored without a plausible round anchor: "
+                        "shift=%s observed_round=%s",
+                        startup_shift,
+                        observed_round,
                     )
-                    recovered += 1
+                    startup_shift = 0
+                else:
+                    for code, round_number in zip(
+                        reversed(sequence[:startup_shift]), round_numbers
+                    ):
+                        self._record_result(
+                            code,
+                            detection,
+                            frame,
+                            f"startup_recovered_shift_{startup_shift}",
+                            round_number,
+                            local_date,
+                        )
+                        recovered += 1
             elif (
                 sequence == self.previous_sequence
                 and observed_round is not None
@@ -1511,6 +1995,11 @@ class GreedyScanner:
                     },
                     self.detector.annotate(frame, detection),
                 )
+                self.previous_sequence = sequence
+                self.last_result_at = utc_now()
+                self.no_result_attempts = 0
+                self._clear_pending_popup_result()
+                self._save_runtime_state("RUNNING", sequence)
             return {
                 "status": "verification_conflict",
                 "confirmations": self.history_verifier.confirmations,
@@ -1667,8 +2156,10 @@ class GreedyScanner:
                             )
                         self.no_result_attempts = 0
                 if (
-                    self.no_result_attempts >= self.max_failed_attempts
-                    and elapsed >= self.round_interval + self.max_failed_attempts * self.scan_interval
+                    self.no_result_attempts >= self.no_result_alert_after_attempts
+                    and elapsed
+                    >= self.round_interval
+                    + self.no_result_alert_after_attempts * self.scan_interval
                     and time.monotonic()
                     - max(
                         self.last_popup_seen_monotonic,
@@ -1678,7 +2169,7 @@ class GreedyScanner:
                 ):
                     self._notify_failure(
                         "RESULT_TIMEOUT",
-                        "Quá 4 lần quét sau thời điểm dự kiến nhưng chưa thấy kèo mới",
+                        f"Quá {self.no_result_alert_after_attempts} lần quét sau thời điểm dự kiến nhưng chưa thấy kèo mới",
                         {
                             "attempts": self.no_result_attempts,
                             "elapsedSeconds": round(elapsed, 1),
@@ -1758,6 +2249,9 @@ class GreedyScanner:
         self._save_runtime_state("STARTING")
         while not self.stop_requested:
             started = time.monotonic()
+            self._check_memory_watchdog()
+            if self.stop_requested:
+                break
             outcome = self.scan_once()
             elapsed = time.monotonic() - started
             if outcome.get("status") in {"popup_dismissed", "recorded"}:
@@ -1784,12 +2278,14 @@ class GreedyScanner:
                 time.sleep(remaining)
         self._collect_countdown_detection()
         self._collect_round_detection()
+        self._collect_financial_detection()
         self._save_runtime_state("STOPPED")
         return 0
 
     def close(self) -> None:
         self.countdown_executor.shutdown(wait=True, cancel_futures=True)
         self.round_executor.shutdown(wait=True, cancel_futures=True)
+        self.financial_executor.shutdown(wait=True, cancel_futures=True)
         self.frame_source.close()
         for handler in self.logger.handlers[:]:
             self.logger.removeHandler(handler)

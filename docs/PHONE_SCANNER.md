@@ -1,5 +1,7 @@
 # Scanner ADB cho điện thoại thật và giả lập
 
+Tự động đặt theo dự đoán và quy trình mô phỏng/LIVE được mô tả riêng tại [AUTO_PLAY.md](AUTO_PLAY.md). Tính năng chỉ dành cho Admin và LIVE mặc định bị khóa cho đến khi hiệu chỉnh đủ tọa độ.
+
 Scanner thống kê dùng chung tại `services/scanner/scanner.py`, giữ nguyên bộ nhận diện
 8 ô lịch sử, popup kết quả, OCR số vòng, countdown, SQLite và dashboard.
 Không cần chạy `RealPhone_Plane/main.py`: đó là chương trình tự động hóa/đặt cược cũ,
@@ -47,7 +49,7 @@ python services/scanner/scanner.py --config services/scanner/config.redmi-k30.js
 `--check` chụp ảnh và kiểm tra nhận diện, không ghi database, không bấm vào điện thoại.
 Xem `runtime/scanner-check/report.json`; khi có ảnh sẽ có `raw.png`, `normalized.png`,
 `regions.png` và các ảnh crop OCR. Exit code: `0` nhận diện lịch sử hoặc popup và số vòng
-thành công, `1` lỗi kết nối/chụp/cấu hình, `2` có ảnh nhưng vùng nhận diện chưa đúng.
+thành công, `1` lỗi kết nối/chụp/cấu hình, `2` có ảnh nhưng vùng nhận diện chưa đúng
 Countdown có thể không xuất hiện khi đang quay hoặc hiển thị kết quả.
 Nếu kiểm tra thất bại, chỉ `report.json` của lần chạy đó là kết quả hiện tại;
 các ảnh còn lại trong thư mục có thể là ảnh của lần kiểm tra trước.
@@ -243,6 +245,26 @@ liên tục**. Cùng một chuỗi không gửi lại ở các mức 4, 5…; ch
 và được gửi bình thường. Payload cảnh báo bệt và lỗi scanner dùng cùng envelope
 JSON để một workflow n8n có thể rẽ nhánh bằng `type` hoặc `eventCode`.
 
+Envelope chung có các trường:
+
+```json
+{
+  "schemaVersion": "1.0",
+  "source": "ToolAutoXalat",
+  "notificationId": "VEGETABLE_STREAK_10:17300",
+  "type": "STREAK_ALERT",
+  "eventCode": "VEGETABLE_STREAK_10",
+  "severity": "WARNING",
+  "title": "Bệt Rau đạt 10 cầu",
+  "message": "Đã xuất hiện 10 kết quả Rau liên tục.",
+  "occurredAtUtc": "2026-09-13T17:00:00Z",
+  "data": {}
+}
+```
+
+Với lỗi hệ thống, `type` là `SCANNER_SYSTEM_EVENT`; với bệt Thịt/Rau, `type` là
+`STREAK_ALERT`.
+
 ## Quét Hot và mức xu cược
 
 Trong thời gian countdown từ 30 đến 1 giây, scanner đọc tám vùng xu vàng dưới
@@ -250,6 +272,20 @@ các cửa `BANH_MI`, `CA_CHUA`, `XIEN`, `CAI`, `DUI`, `NGO`, `BO`, `CA_ROT` và
 tám vùng có thể xuất hiện nhãn Hot. Dữ liệu được lưu trong
 `scanner_state.scanner_betting_signals`, trả về qua trường `bettingSignals` của
 `GET /api/scanner/status`, rồi hiển thị ở dashboard và màn chơi thử.
+
+## OCR số dư và tiền tự đặt
+
+Profile điện thoại thật có thêm khối `financials`. Scanner chỉ đọc ảnh, không gửi
+thao tác chạm:
+
+- `balance_crop` đọc số xu trong ô **Khả dụng** bên trái.
+- `items[].amount_region` đọc số tiền của người chơi dưới từng vật phẩm.
+- Kết quả mới (tối đa 8 giây) được lưu tại `scanner_state.scanner_financials` và
+  trả về qua trường `financials` của `GET /api/scanner/status`.
+
+Hai cách tiền xử lý OCR phải cùng đọc một số tiền vật phẩm; nếu không đồng thuận,
+scanner trả `0` để tránh xác minh nhầm. Khi chạy LIVE, Auto Play dừng ngay nếu số
+dư hoặc tiền theo vật phẩm không khớp kế hoạch và không tự gửi lại lệnh.
 
 Các tọa độ, ngưỡng HSV, diện tích hình xu và nhãn Hot nằm trong phần
 `betting_signals` của từng profile. Tọa độ dùng ảnh tham chiếu 720×1600, scale

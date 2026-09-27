@@ -72,7 +72,7 @@ $backend = Start-Process -FilePath 'dotnet' `
     -PassThru
 
 $frontend = Start-Process -FilePath 'npm.cmd' `
-    -ArgumentList @('run', 'dev', '--', '--host', '127.0.0.1', '--port', '5173') `
+    -ArgumentList @('run', 'preview', '--', '--host', '127.0.0.1', '--port', '5173') `
     -WorkingDirectory $frontendDir `
     -WindowStyle Hidden `
     -RedirectStandardOutput (Join-Path $logDir 'frontend.stdout.log') `
@@ -104,18 +104,13 @@ $state = [ordered]@{
     scannerSourceSerial = $sourceSerial
     scannerConfigPath = $ScannerConfig
 }
-$previousTunnel = if (Test-Path -LiteralPath $stoppedStatePath) {
-    Get-Content -LiteralPath $stoppedStatePath -Raw | ConvertFrom-Json
-}
-if ($previousTunnel.cloudflaredPid) {
-    $cloudflared = Get-Process -Id $previousTunnel.cloudflaredPid -ErrorAction SilentlyContinue
-    if ($cloudflared -and $cloudflared.ProcessName -eq 'cloudflared') {
-        $state['cloudflaredPid'] = [int]$previousTunnel.cloudflaredPid
-        $state['cloudflareUrl'] = $previousTunnel.cloudflareUrl
-        $state['cloudflareStartedAt'] = $previousTunnel.cloudflareStartedAt
-        $state['cloudflareLog'] = $previousTunnel.cloudflareLog
-    }
-}
+$tunnel = & (Join-Path $PSScriptRoot 'start-zrok-tunnel.ps1') -TargetPort 5173
+$state['tunnelProvider'] = $tunnel.Provider
+$state['publicUrl'] = $tunnel.PublicUrl
+$state['zrokUrl'] = $tunnel.PublicUrl
+$state['zrokShareName'] = $tunnel.ShareName
+$state['zrokAgentPid'] = $tunnel.AgentPid
+$state['zrokLog'] = $tunnel.AgentLog
 $state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding utf8
 
 $restartArguments = @{ ConfigPath = $ScannerConfig }
@@ -151,4 +146,5 @@ $scannerStatus = Invoke-RestMethod -Uri 'http://127.0.0.1:5117/api/scanner/statu
 Write-Host "Backend : http://127.0.0.1:5117 (PID $($backend.Id))"
 Write-Host "Frontend: http://127.0.0.1:5173 (PID $($frontend.Id))"
 Write-Host "Scanner : PID $scannerPid, status=$($scannerStatus.status), online=$($scannerStatus.isOnline)"
+Write-Host "Public  : $($tunnel.PublicUrl) ($($tunnel.Provider))"
 Write-Host "Logs    : $logDir"
